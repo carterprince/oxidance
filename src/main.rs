@@ -81,6 +81,8 @@ struct Ui {
     resolving: Cell<bool>,
     buffering: Cell<bool>,
     playback_generation: Cell<u64>,
+    stream_attempt: Cell<u32>,
+    resume_at: Cell<Option<gst::ClockTime>>,
     resolve_cancel: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     row_play_buttons: RefCell<Vec<(String, glib::WeakRef<gtk::Button>)>>,
     music_directory: PathBuf,
@@ -335,7 +337,7 @@ impl Ui {
             playback_rate: Cell::new(saved_speed), applied_rate: Cell::new(1.0), settings,
             player: RefCell::new(None), bus_watch: RefCell::new(None), current_song: RefCell::new(None),
             desired_playing: Cell::new(false), resolving: Cell::new(false), buffering: Cell::new(false),
-            playback_generation: Cell::new(0), resolve_cancel: RefCell::new(None), row_play_buttons: RefCell::new(vec![]),
+            playback_generation: Cell::new(0), stream_attempt: Cell::new(1), resume_at: Cell::new(None), resolve_cancel: RefCell::new(None), row_play_buttons: RefCell::new(vec![]),
             music_directory, download_queue: RefCell::new(None), download_spinners: RefCell::new(vec![]), completed_downloads: RefCell::new(HashMap::new()),
             remote: Default::default(), sync: RefCell::new(None),
         });
@@ -1252,6 +1254,22 @@ impl Ui {
         self.buffering.set(false);
     }
 
+    /// YouTube intermittently rejects stream URLs (for example, HTTP 403). Retry
+    /// network streams with fresh URLs from yt-dlp, resuming where playback stopped.
+    fn stream_failed(self: &Rc<Self>, error: &str) {
+        const ATTEMPTS: u32 = 3;
+        let attempt = self.stream_attempt.get();
+        let song = self.current_song.borrow().clone();
+        if let Some(song) = song && attempt < ATTEMPTS && downloads::local_file(&self.music_directory, &song.video_id).is_none() {
+            eprintln!("Stream attempt {attempt} of {ATTEMPTS} for {} failed, retrying: {error}", song.video_id);
+            let position = self.player.borrow().as_ref().and_then(|player| player.query_position::<gst::ClockTime>())
+                .filter(|position| !position.is_zero()).or(self.resume_at.get());
+            self.load_song(&song, self.desired_playing.get(), attempt + 1, position);
+            return;
+        }
+        self.playback_failed(error);
+    }
+
     fn playback_failed(&self, error: &str) {
         self.stop_player();
         self.desired_playing.set(false);
@@ -1322,7 +1340,14 @@ impl Ui {
     }
 
     fn load_queued_song(self: &Rc<Self>, song: &Song, autoplay: bool) {
+        self.load_song(song, autoplay, 1, None);
+    }
+
+    /// Loads a song. `attempt` and `resume` are used when retrying a failed stream.
+    fn load_song(self: &Rc<Self>, song: &Song, autoplay: bool, attempt: u32, resume: Option<gst::ClockTime>) {
         self.stop_player();
+        self.stream_attempt.set(attempt);
+        self.resume_at.set(resume);
         self.playback_generation.set(self.playback_generation.get() + 1);
         let generation = self.playback_generation.get();
         *self.current_song.borrow_mut() = Some(song.clone());
@@ -1358,8 +1383,8 @@ impl Ui {
             ui.resolving.set(false);
             ui.resolve_cancel.borrow_mut().take();
             match result {
-                Ok(stream) => if let Err(error) = ui.start_stream(stream, generation) { ui.playback_failed(&error); },
-                Err(error) => ui.playback_failed(&error),
+                Ok(stream) => if let Err(error) = ui.start_stream(stream, generation) { ui.stream_failed(&error); },
+                Err(error) => ui.stream_failed(&error),
             }
         });
     }
@@ -1450,7 +1475,7 @@ impl Ui {
                     ui.update_timeline();
                     if sought { if let Some(service) = ui.mpris.borrow().as_ref() { service.seeked(&ui); } }
                 }
-                gst::MessageView::Error(error) => ui.playback_failed(&error.error().to_string()),
+                gst::MessageView::Error(error) => ui.stream_failed(&error.error().to_string()),
                 gst::MessageView::Eos(_) => {
                     if ui.queue_position.get() + 1 < ui.playback_order.borrow().len() { ui.advance_queue(true); return glib::ControlFlow::Continue; }
                     ui.stop_player();
@@ -1482,6 +1507,15 @@ impl Ui {
         if duration.is_zero() { return; }
         let mut query = gst::query::Seeking::new(gst::Format::Time);
         let seekable = player.query(&mut query) && query.result().0;
+        // A retried stream resumes where the failed one stopped, at the chosen speed.
+        if seekable && let Some(position) = self.resume_at.take() {
+            if player.seek(self.playback_rate.get(), gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::SeekType::Set, position, gst::SeekType::None, gst::ClockTime::NONE).is_ok() {
+                self.applied_rate.set(self.playback_rate.get());
+                self.seek_pending.set(true);
+                return;
+            }
+        }
         if seekable && self.applied_rate.get() != self.playback_rate.get() {
             if let Some(position) = player.query_position::<gst::ClockTime>() {
                 if player.seek(self.playback_rate.get(), gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
@@ -1999,6 +2033,42 @@ mod tests {
         assert!(!indicator.is_visible(), "completion check mark must disappear after two seconds");
         ui.window.close();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a desktop display and network access for yt-dlp"]
+    fn ui_stream_retry_and_resume() {
+        adw::init().unwrap();
+        gst::init().unwrap();
+        let path = std::env::temp_dir().join(format!("oxidance-retry-{}.wav", std::process::id()));
+        let generator = gst::parse::launch(&format!("audiotestsrc num-buffers=3000 samplesperbuffer=480 ! audio/x-raw,rate=48000 ! wavenc ! filesink location={}", path.display())).unwrap();
+        generator.set_state(gst::State::Playing).unwrap();
+        generator.bus().unwrap().timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Eos, gst::MessageType::Error]).unwrap();
+        generator.set_state(gst::State::Null).unwrap();
+        let app = adw::Application::builder().application_id("io.github.oxidance.RetryTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let ui = Ui::new(&app, std::env::temp_dir().join(format!("oxidance-retry-test-{}/library.json", std::process::id())));
+        let wait = |done: &dyn Fn() -> bool, seconds: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+            while !done() && std::time::Instant::now() < deadline { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        };
+        // A retried stream resumes where the failed one stopped.
+        ui.resume_at.set(Some(gst::ClockTime::from_seconds(12)));
+        ui.start_stream(playback::Stream { url: gtk::gio::File::for_path(&path).uri().to_string(), http_headers: Default::default() }, ui.playback_generation.get()).unwrap();
+        wait(&|| ui.resume_at.get().is_none() && !ui.seek_pending.get(), 5);
+        let position = ui.player.borrow().as_ref().unwrap().query_position::<gst::ClockTime>().unwrap();
+        assert!((12..14).contains(&position.seconds()), "resumed at {position}");
+        // An unreachable network stream is retried with fresh URLs, then reported.
+        ui.stop_player();
+        *ui.current_song.borrow_mut() = Some(Song { video_id: "xxxxxxxxxxx".into(), title: "Unavailable".into(), artist: None, album_art_url: None, artists: vec![] });
+        ui.stream_attempt.set(1);
+        ui.start_stream(playback::Stream { url: "http://127.0.0.1:9/stream.webm".into(), http_headers: Default::default() }, ui.playback_generation.get()).unwrap();
+        wait(&|| ui.stream_attempt.get() == 3 && !ui.resolving.get() && ui.player.borrow().is_none(), 90);
+        assert_eq!(ui.stream_attempt.get(), 3, "network streams are attempted three times");
+        assert!(!ui.resolving.get() && ui.player.borrow().is_none(), "playback stops after the last attempt");
+        ui.window.close();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
