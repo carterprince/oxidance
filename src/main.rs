@@ -1565,10 +1565,6 @@ impl Ui {
             ui.spinner.set_visible(false);
             match result {
                 Ok((page, artists)) => {
-                    if !append {
-                        ui.search_controls.set_visible_child_name("title");
-                        ui.list.grab_focus();
-                    }
                     *ui.cursor.borrow_mut() = page.next;
                     if !append {
                         match artists {
@@ -2083,6 +2079,8 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("oxidance-artist-test-{}", std::process::id()));
         let ui = Ui::new(&app, directory.join("library.json"));
         ui.entry.set_text("nujabes");
+        ui.entry.grab_focus();
+        ui.entry.set_position(3);
         ui.entry.emit_by_name::<()>("activate", &[]);
         let deadline = std::time::Instant::now() + Duration::from_secs(45);
         while ui.page_loading.get() && std::time::Instant::now() < deadline {
@@ -2092,7 +2090,10 @@ mod tests {
         let first = ui.list.first_child().unwrap().downcast::<adw::ActionRow>().unwrap();
         assert_eq!(first.title(), "Nujabes", "exact artist match must be first");
         assert_eq!(first.subtitle().as_deref(), Some("Artist"));
-        assert_eq!(ui.search_controls.visible_child_name().as_deref(), Some("title"));
+        assert_eq!(ui.search_controls.visible_child_name().as_deref(), Some("search"), "the search field stays open");
+        let focus = gtk::prelude::GtkWindowExt::focus(&ui.window).unwrap();
+        assert!(focus == *ui.entry.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&ui.entry), "the search field keeps focus");
+        assert_eq!(ui.entry.position(), 3, "the cursor stays in place");
         first.emit_by_name::<()>("activated", &[]);
         assert!(ui.view.get() == View::Artist);
         let deadline = std::time::Instant::now() + Duration::from_secs(45);
