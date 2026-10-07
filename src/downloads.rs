@@ -7,19 +7,47 @@ pub type Remote = Arc<Mutex<Option<Arc<Dav>>>>;
 
 const EXTENSIONS: &[&str] = &["webm", "m4a", "mp4", "ogg", "opus", "mp3", "aac", "flac", "wav"];
 
-pub fn local_file(directory: &Path, id: &str) -> Option<PathBuf> {
-    let marker = format!("[{id}]");
-    std::fs::read_dir(directory).ok()?.filter_map(Result::ok).map(|entry| entry.path())
-        .find(|path| path.is_file()
-            && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| EXTENSIONS.contains(&ext))
-            && path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| stem.ends_with(&marker))
-            && path.metadata().is_ok_and(|metadata| metadata.len() > 0))
+/// Saved audio files by video ID, from a single scan of the music directory.
+#[derive(Default)]
+pub struct Index(HashMap<String, PathBuf>);
+
+impl Index {
+    pub fn scan(directory: &Path) -> Self {
+        let mut files = HashMap::new();
+        let Ok(entries) = std::fs::read_dir(directory) else { return Self(files); };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Some(id) = audio_id(&path) else { continue; };
+            if files.contains_key(id) { continue; }
+            // The directory entry's type avoids a stat for each unrelated file.
+            let is_file = entry.file_type().is_ok_and(|kind| kind.is_file() || kind.is_symlink() && path.is_file());
+            if is_file && path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+                files.insert(id.to_owned(), path.clone());
+            }
+        }
+        Self(files)
+    }
+
+    pub fn file(&self, id: &str) -> Option<&Path> { self.0.get(id).map(PathBuf::as_path) }
+
+    pub fn art(&self, id: &str) -> Option<PathBuf> {
+        let path = self.file(id)?.with_extension("cover");
+        path.metadata().is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0).then_some(path)
+    }
 }
 
-pub fn local_art(directory: &Path, id: &str) -> Option<PathBuf> {
-    let path = local_file(directory, id)?.with_extension("cover");
-    path.metadata().is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0).then_some(path)
+/// The video ID of a finished audio file named `… [ID].ext`.
+fn audio_id(path: &Path) -> Option<&str> {
+    path.extension().and_then(|ext| ext.to_str()).filter(|ext| EXTENSIONS.contains(ext))?;
+    let stem = path.file_stem()?.to_str()?.strip_suffix(']')?;
+    stem.rsplit_once('[').map(|(_, id)| id).filter(|id| !id.is_empty())
 }
+
+pub fn local_file(directory: &Path, id: &str) -> Option<PathBuf> {
+    Index::scan(directory).file(id).map(Path::to_path_buf)
+}
+
+pub fn local_art(directory: &Path, id: &str) -> Option<PathBuf> { Index::scan(directory).art(id) }
 
 fn save_art(audio: &Path, song: &Song, cancelled: &AtomicBool) -> Result<(), String> {
     let Some(url) = &song.album_art_url else { return Ok(()); };
@@ -46,10 +74,10 @@ fn save_art(audio: &Path, song: &Song, cancelled: &AtomicBool) -> Result<(), Str
     std::fs::write(source, preferred).map_err(|error| error.to_string())
 }
 
-pub fn needs_art_upgrade(directory: &Path, song: &Song) -> bool {
+pub fn needs_art_upgrade(index: &Index, song: &Song) -> bool {
     let Some(url) = &song.album_art_url else { return false; };
     let preferred = oxidance::high_quality_art_url(url);
-    let Some(audio) = local_file(directory, &song.video_id) else { return false; };
+    let Some(audio) = index.file(&song.video_id) else { return false; };
     preferred != *url && !std::fs::read_to_string(audio.with_extension("cover.source")).is_ok_and(|saved| saved == preferred)
 }
 
@@ -68,7 +96,7 @@ pub fn download(directory: &Path, song: &Song, remote: Option<&Dav>, cancelled: 
     save_art(&path, song, &cancelled).map_err(|error| format!("Audio is saved, but album art failed: {error}"))?;
     if let Some(dav) = remote {
         // Failures are retried and reported by the next sync.
-        let _ = dav.songs(false).and_then(|listing| upload_to_server(dav, directory, song, &listing));
+        let _ = dav.songs(false).and_then(|listing| upload_to_server(dav, &path, song, &listing));
     }
     Ok(path)
 }
@@ -105,13 +133,12 @@ fn fetch_from_server(dav: &Dav, directory: &Path, song: &Song, cancelled: &Atomi
 
 /// Uploads a saved song's audio and artwork if the server is missing them.
 /// Returns whether anything was uploaded.
-pub fn upload_to_server(dav: &Dav, directory: &Path, song: &Song, listing: &HashMap<String, u64>) -> Result<bool, String> {
+pub fn upload_to_server(dav: &Dav, audio: &Path, song: &Song, listing: &HashMap<String, u64>) -> Result<bool, String> {
     let id = &song.video_id;
-    let Some(audio) = local_file(directory, id) else { return Ok(false); };
     let mut uploaded = false;
     if remote_audio(listing, id).is_none() {
         let extension = audio.extension().unwrap().to_string_lossy();
-        dav.upload(&format!("{SONGS}{id}.{extension}"), &audio)?;
+        dav.upload(&format!("{SONGS}{id}.{extension}"), audio)?;
         uploaded = true;
     }
     let cover = audio.with_extension("cover");
@@ -213,6 +240,23 @@ mod tests {
             album_art_url: Some("http://127.0.0.1:9/unavailable".into()), artists: vec![] };
         assert_eq!(download(&directory, &song, None, Arc::new(AtomicBool::new(false))).unwrap(), audio);
         assert_eq!(std::fs::read(local_art(&directory, "example").unwrap()).unwrap(), cover);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn index_maps_finished_audio_files_by_id() {
+        let directory = std::env::temp_dir().join(format!("oxidance-index-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, contents) in [("A - Song [one].webm", "audio"), ("A - Song [one].cover", "art"), ("B [two].m4a.part", "partial"),
+            ("C [three].mp3", ""), ("Other [x] song.mp3", "audio"), ("Brackets [in] title [four].opus", "audio"), ("Plain.mp3", "audio")] {
+            std::fs::write(directory.join(name), contents).unwrap();
+        }
+        let index = Index::scan(&directory);
+        assert_eq!(index.file("one"), Some(directory.join("A - Song [one].webm").as_path()));
+        assert_eq!(index.art("one"), Some(directory.join("A - Song [one].cover")));
+        assert_eq!(index.file("four"), Some(directory.join("Brackets [in] title [four].opus").as_path()));
+        for missing in ["two", "three", "x", "in"] { assert!(index.file(missing).is_none(), "{missing}"); }
+        assert!(Index::scan(&directory.join("missing")).file("one").is_none());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

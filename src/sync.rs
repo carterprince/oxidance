@@ -65,10 +65,12 @@ fn cycle(dav: &Dav, local: &Library, base_path: &Path, music: &Path, events: &as
     let _ = events.send_blocking(Event::Library(merged.clone()));
     let listing = dav.songs(true)?;
     let songs = saved_songs(&merged);
+    let files = downloads::Index::scan(music);
     let mut uploaded = 0;
     for (index, song) in songs.iter().enumerate() {
         let _ = events.send_blocking(Event::Progress(format!("Checking saved songs ({} of {})…", index + 1, songs.len())));
-        if downloads::upload_to_server(dav, music, song, &listing)? { uploaded += 1; }
+        let Some(audio) = files.file(&song.video_id) else { continue; };
+        if downloads::upload_to_server(dav, audio, song, &listing)? { uploaded += 1; }
     }
     Ok(match uploaded {
         0 => "Library and songs are up to date.".into(),
@@ -281,7 +283,8 @@ impl Controller {
             return;
         }
         *ui.library.borrow_mut() = next;
-        for song in ui.saved_songs() { ui.queue_download(&song); }
+        let files = downloads::Index::scan(&ui.music_directory);
+        for song in ui.saved_songs() { ui.queue_download(&song, &files); }
         if let View::Playlist(id) = ui.view.get() && !ui.library.borrow().playlists.iter().any(|playlist| playlist.id == id) {
             ui.navigate(View::Liked);
         } else {

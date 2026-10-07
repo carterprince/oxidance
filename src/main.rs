@@ -51,6 +51,7 @@ struct Ui {
     page_loading: Cell<bool>,
     pagination_failed: Cell<bool>,
     art_cache: RefCell<HashMap<String, gdk::Texture>>,
+    saved_art: RefCell<HashMap<PathBuf, (Option<std::time::SystemTime>, gdk::Texture)>>,
     pending_art: RefCell<Vec<(gtk::Image, String)>>,
     playback_bar: gtk::Box,
     playback_art: gtk::Image,
@@ -325,7 +326,7 @@ impl Ui {
             artist_request: Cell::new(0), artist_loading: Cell::new(false), biography_expanded: Cell::new(false), artist_error: RefCell::new(None),
             artist_back, artist_previous: Cell::new(View::Search),
             artist_previous_scroll: Cell::new(0.0), artist_previous_filter: RefCell::new(String::new()),
-            generation: Cell::new(0), search_request: Cell::new(0), art_cache: RefCell::new(HashMap::new()),
+            generation: Cell::new(0), search_request: Cell::new(0), art_cache: RefCell::new(HashMap::new()), saved_art: RefCell::new(HashMap::new()),
             debounce: RefCell::new(None), query: RefCell::new(String::new()),
             cursor: RefCell::new(None), page_loading: Cell::new(false), pagination_failed: Cell::new(false), pending_art: RefCell::new(vec![]),
             playback_bar, playback_art, sidebar_art, playback_button, playback_title,
@@ -510,6 +511,7 @@ impl Ui {
             return false;
         }
         *self.library.borrow_mut() = next;
+        let mut files = None;
         for song in self.saved_songs() {
             let newly_saved = {
                 let library = self.library.borrow();
@@ -519,7 +521,10 @@ impl Ui {
                             && old.songs.iter().any(|saved| saved.video_id == song.video_id))
                 })
             };
-            if newly_saved { self.queue_download(&song); }
+            if newly_saved {
+                let files = files.get_or_insert_with(|| downloads::Index::scan(&self.music_directory));
+                self.queue_download(&song, files);
+            }
         }
         self.refresh_sidebar();
         self.render_preserving_scroll();
@@ -557,10 +562,10 @@ impl Ui {
             .filter(|song| ids.insert(song.video_id.clone())).cloned().collect()
     }
 
-    fn queue_download(&self, song: &Song) {
-        if downloads::local_file(&self.music_directory, &song.video_id).is_none()
-            || song.album_art_url.is_some() && downloads::local_art(&self.music_directory, &song.video_id).is_none()
-            || downloads::needs_art_upgrade(&self.music_directory, song) {
+    fn queue_download(&self, song: &Song, files: &downloads::Index) {
+        if files.file(&song.video_id).is_none()
+            || song.album_art_url.is_some() && files.art(&song.video_id).is_none()
+            || downloads::needs_art_upgrade(files, song) {
             if let Some(queue) = self.download_queue.borrow().as_ref() { queue.enqueue(song); }
         }
         self.update_download_spinners();
@@ -615,7 +620,8 @@ impl Ui {
             }
         });
         // Resume missing or interrupted downloads for the existing library.
-        for song in self.saved_songs() { self.queue_download(&song); }
+        let files = downloads::Index::scan(&self.music_directory);
+        for song in self.saved_songs() { self.queue_download(&song, &files); }
     }
 
     fn navigate(self: &Rc<Self>, view: View) {
@@ -1033,16 +1039,19 @@ impl Ui {
     }
 
     fn append_songs(self: &Rc<Self>, songs: &[Song]) {
+        let files = downloads::Index::scan(&self.music_directory);
+        let mut saved = Vec::new();
         for song in songs {
             let image = self.add_song(song);
-            if let Some(path) = downloads::local_art(&self.music_directory, &song.video_id) {
-                image.set_from_file(Some(path));
+            if let Some(path) = files.art(&song.video_id) {
+                saved.push((image, path));
             } else if let Some(url) = &song.album_art_url {
                 let url = if self.view.get() == View::Search { oxidance::search_art_url(url) } else { url.clone() };
                 if let Some(texture) = self.art_cache.borrow().get(&url) { image.set_paintable(Some(texture)); }
                 else { self.pending_art.borrow_mut().push((image, url)); }
             }
         }
+        self.load_saved_art(saved);
         let weak = Rc::downgrade(self);
         self.scroll.add_tick_callback(move |_, _| {
             if let Some(ui) = weak.upgrade() {
@@ -1052,6 +1061,41 @@ impl Ui {
                 ui.load_visible_art();
             }
             glib::ControlFlow::Break
+        });
+    }
+
+    /// Shows saved covers as thumbnails. Full-size covers are decoded at row size
+    /// on a background thread, so long lists do not delay the window.
+    fn load_saved_art(self: &Rc<Self>, images: Vec<(gtk::Image, PathBuf)>) {
+        let mut pending = Vec::new();
+        for (image, path) in images {
+            let modified = path.metadata().and_then(|metadata| metadata.modified()).ok();
+            match self.saved_art.borrow().get(&path) {
+                Some((saved, texture)) if *saved == modified => image.set_paintable(Some(texture)),
+                _ => pending.push((image, path, modified)),
+            }
+        }
+        if pending.is_empty() { return; }
+        let size = 72 * self.window.scale_factor().max(2);
+        let paths: Vec<_> = pending.iter().map(|(_, path, _)| path.clone()).collect();
+        let (sender, receiver) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            for (index, path) in paths.into_iter().enumerate() {
+                let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, size, size, true) else { continue; };
+                let format = if pixbuf.has_alpha() { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
+                let pixels = (pixbuf.width(), pixbuf.height(), format, pixbuf.read_pixel_bytes(), pixbuf.rowstride() as usize);
+                if sender.send_blocking((index, pixels)).is_err() { break; }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            while let Ok((index, (width, height, format, bytes, stride))) = receiver.recv().await {
+                let Some(ui) = weak.upgrade() else { break; };
+                let (image, path, modified) = &pending[index];
+                let texture: gdk::Texture = gdk::MemoryTexture::new(width, height, format, &bytes, stride).upcast();
+                image.set_paintable(Some(&texture));
+                ui.saved_art.borrow_mut().insert(path.clone(), (*modified, texture));
+            }
         });
     }
 
@@ -1935,6 +1979,11 @@ mod tests {
         let image = descendants(ui.list.upcast_ref()).into_iter().find_map(|widget| {
             (widget.widget_name() == "song-art-offline").then(|| widget.downcast::<gtk::Image>().ok()).flatten()
         }).unwrap();
+        // Saved covers are decoded in the background.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !image.paintable().is_some_and(|paintable| paintable.is::<gdk::Texture>()) && std::time::Instant::now() < deadline {
+            pump(); std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(image.paintable().is_some_and(|paintable| paintable.is::<gdk::Texture>()));
         assert!(ui.pending_art.borrow().is_empty(), "offline artwork must not enqueue network requests");
         assert!(ui.art_cache.borrow().is_empty(), "artwork must work without an in-memory cache");
