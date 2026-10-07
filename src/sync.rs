@@ -25,6 +25,8 @@ fn load_base(path: &Path, url: &str) -> Result<Option<Library>, String> {
 
 fn save_base(path: &Path, url: &str, library: &Library) -> Result<(), String> {
     let bytes = serde_json::to_vec(&Base { url: url.to_owned(), library: library.clone() }).map_err(|error| error.to_string())?;
+    // A new device has no data directory until its library is first saved.
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|error| error.to_string())?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, bytes).and_then(|_| std::fs::rename(&temporary, path)).map_err(|error| error.to_string())
 }
@@ -448,6 +450,10 @@ mod tests {
         // An emptied local library is treated as a fresh device, not a mass deletion.
         cycle(&dav, &Library::default(), &second.join("sync-base.json"), &second.join("Music"), &events).unwrap();
         assert!(load_base(&second.join("sync-base.json"), url.as_str()).unwrap().unwrap().is_liked(&song("one")));
+        // A brand-new device has no data directory yet.
+        let fresh = root.join("fresh/oxidance/sync-base.json");
+        cycle(&dav, &Library::default(), &fresh, &root.join("fresh/Music"), &events).unwrap();
+        assert!(load_base(&fresh, url.as_str()).unwrap().unwrap().is_liked(&song("one")));
         // The lock is released after each pass.
         let token = dav.lock(LIBRARY).unwrap();
         dav.unlock(LIBRARY, &token).unwrap();
