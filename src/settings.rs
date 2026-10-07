@@ -28,9 +28,9 @@ mod tests {
         settings.set_double("playback-speed", 1.23).unwrap();
         let reopened = gio::Settings::new_full(&settings.settings_schema().unwrap(), settings.backend().as_ref(), None);
         assert_eq!(reopened.double("playback-speed"), 1.23);
-        assert!(!settings.boolean("artwork-in-sidebar"));
-        settings.set_boolean("artwork-in-sidebar", true).unwrap();
-        assert!(reopened.boolean("artwork-in-sidebar"));
+        assert!(settings.boolean("artwork-in-sidebar"));
+        settings.set_boolean("artwork-in-sidebar", false).unwrap();
+        assert!(!reopened.boolean("artwork-in-sidebar"));
         assert!(!settings.boolean("shuffle"));
         assert_eq!(settings.string("last-song"), "");
         settings.set_string("last-song", "saved metadata").unwrap();

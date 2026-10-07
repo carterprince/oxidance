@@ -8,7 +8,7 @@
       <description>Playback speed multiplier, without pitch correction.</description>
     </key>
     <key name="artwork-in-sidebar" type="b">
-      <default>false</default>
+      <default>true</default>
       <summary>Show playback artwork in the sidebar</summary>
       <description>Show the playing song's album art enlarged at the bottom of the sidebar instead of in the playback bar.</description>
     </key>

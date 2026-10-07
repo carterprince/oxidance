@@ -2023,6 +2023,12 @@ mod tests {
         pump();
         let row = descendants(ui.window.upcast_ref()).into_iter()
             .find_map(|widget| widget.downcast::<adw::SwitchRow>().ok()).unwrap();
+        assert!(row.is_active(), "sidebar artwork is on by default");
+        row.set_active(false);
+        pump();
+        assert!(!ui.settings.boolean("artwork-in-sidebar"));
+        assert!(!ui.sidebar_art.is_visible());
+        assert!(ui.playback_art.is_visible());
         row.set_active(true);
         pump();
         assert!(ui.settings.boolean("artwork-in-sidebar"));
