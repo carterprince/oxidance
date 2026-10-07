@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/oxidance/Oxidance">
+    <file>icons/scalable/apps/io.github.oxidance.Oxidance.svg</file>
+  </gresource>
+</gresources>

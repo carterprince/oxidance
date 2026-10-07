@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Oxidance
+Comment=Search and listen to music
+Exec=oxidance
+Icon=io.github.oxidance.Oxidance
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=Music;YouTube;Playlists;
+StartupNotify=true
+StartupWMClass=io.github.oxidance.Oxidance

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="128" height="128" viewBox="0 0 128 128">
+  <title>Oxidance</title>
+  <desc>Two beamed eighth notes in polished, rusted iron.</desc>
+  <defs>
+    <path id="head-left" d="M 54.69,89.26 A 18,13.5 -22 1 0 21.31,102.74 A 18,13.5 -22 1 0 54.69,89.26 Z"/>
+    <path id="head-right" d="M 106.69,77.26 A 18,13.5 -22 1 0 73.31,90.74 A 18,13.5 -22 1 0 106.69,77.26 Z"/>
+    <path id="frame" d="M 45,35 L 107,21 L 107,80 L 97,80 L 97,41 L 55,51 L 55,92 L 45,92 Z"/>
+    <!-- One continuous gradient across all parts, so overlapping shapes blend. -->
+    <linearGradient id="body" x1="22" y1="20" x2="100" y2="114" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#c8622e"/>
+      <stop offset=".16" stop-color="#eb9a62"/>
+      <stop offset=".3" stop-color="#b14a1c"/>
+      <stop offset=".52" stop-color="#7e2f12"/>
+      <stop offset=".68" stop-color="#b8562a"/>
+      <stop offset=".8" stop-color="#df8550"/>
+      <stop offset="1" stop-color="#8a3414"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="20" y1="0" x2="110" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#43190a"/>
+      <stop offset=".5" stop-color="#6e2c12"/>
+      <stop offset="1" stop-color="#43190a"/>
+    </linearGradient>
+    <linearGradient id="glint" x1="45" y1="0" x2="107" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffd9b8" stop-opacity=".15"/>
+      <stop offset=".45" stop-color="#fff1e2" stop-opacity=".8"/>
+      <stop offset="1" stop-color="#ffd9b8" stop-opacity=".1"/>
+    </linearGradient>
+    <clipPath id="heads">
+      <path d="M 54.69,89.26 A 18,13.5 -22 1 0 21.31,102.74 A 18,13.5 -22 1 0 54.69,89.26 Z"/>
+      <path d="M 106.69,77.26 A 18,13.5 -22 1 0 73.31,90.74 A 18,13.5 -22 1 0 106.69,77.26 Z"/>
+    </clipPath>
+  </defs>
+  <g transform="translate(64 64) scale(1.15) translate(-63.5 -68)">
+  <!-- Lower edge for Adwaita-style depth. -->
+  <g fill="url(#edge)" transform="translate(0 5)">
+    <use xlink:href="#head-left"/>
+    <use xlink:href="#head-right"/>
+    <use xlink:href="#frame"/>
+  </g>
+  <!-- Note heads with curved reflections. -->
+  <g fill="url(#body)">
+    <use xlink:href="#head-left"/>
+    <use xlink:href="#head-right"/>
+  </g>
+  <g clip-path="url(#heads)" fill="#ffe7cc" opacity=".75">
+    <path d="M 24,96 C 26,87 34,82 44,82 C 36,85 31,90 28,97 Z"/>
+    <path d="M 76,84 C 78,75 86,70 96,70 C 88,73 83,78 80,85 Z"/>
+  </g>
+  <!-- Stems and beam drawn over the heads in the same gradient. -->
+  <use xlink:href="#frame" fill="url(#body)"/>
+  <!-- Polished top edge of the beam. -->
+  <path d="M 45,35 L 107,21 L 107,25.5 L 45,39.5 Z" fill="url(#glint)"/>
+  </g>
+</svg>

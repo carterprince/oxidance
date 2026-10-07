@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="io.github.oxidance" path="/io/github/oxidance/">
+    <key name="playback-speed" type="d">
+      <default>1.0</default>
+      <range min="0.5" max="2.0"/>
+      <summary>Playback speed</summary>
+      <description>Playback speed multiplier, without pitch correction.</description>
+    </key>
+    <key name="artwork-in-sidebar" type="b">
+      <default>false</default>
+      <summary>Show playback artwork in the sidebar</summary>
+      <description>Show the playing song's album art enlarged at the bottom of the sidebar instead of in the playback bar.</description>
+    </key>
+    <key name="shuffle" type="b">
+      <default>false</default>
+      <summary>Shuffle playback</summary>
+      <description>Restore the shuffle setting when the application starts.</description>
+    </key>
+    <key name="last-song" type="s">
+      <default>''</default>
+      <summary>Last selected song</summary>
+      <description>Song metadata restored paused when the application starts.</description>
+    </key>
+    <key name="sync-url" type="s">
+      <default>''</default>
+      <summary>Sync server URL</summary>
+      <description>WebDAV server used to sync the library and saved songs. Empty when sync is not connected.</description>
+    </key>
+    <key name="sync-username" type="s">
+      <default>''</default>
+      <summary>Sync server username</summary>
+      <description>Username for the sync server. The password is stored in the system keyring.</description>
+    </key>
+  </schema>
+</schemalist>
