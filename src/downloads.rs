@@ -163,6 +163,21 @@ pub fn upload_to_server(dav: &Dav, audio: &Path, song: &Song, listing: &HashMap<
     Ok(uploaded)
 }
 
+/// Runs `attempt` up to `attempts` times, stopping early on success or cancellation.
+fn with_retries<T>(attempts: u32, delay: Duration, cancelled: &AtomicBool, mut attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    let mut tries = 1;
+    loop {
+        match attempt() {
+            Err(error) if tries < attempts && !cancelled.load(Ordering::Relaxed) => {
+                eprintln!("Attempt {tries} of {attempts} failed, retrying: {error}");
+                std::thread::sleep(delay);
+                tries += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 fn download_audio(directory: &Path, song: &Song, cancelled: Arc<AtomicBool>) -> Result<PathBuf, String> {
     if let Some(path) = local_file(directory, &song.video_id) { return Ok(path); }
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
@@ -176,7 +191,11 @@ fn download_audio(directory: &Path, song: &Song, cancelled: Arc<AtomicBool>) -> 
         "%(artist,uploader)s - %(title)s [%(id)s].%(ext)s".into(),
         "--".into(), format!("https://music.youtube.com/watch?v={}", song.video_id),
     ]).collect();
-    super::playback::run(&args, cancelled, Duration::from_secs(20 * 60))?;
+    // YouTube intermittently rejects a download URL (for example, HTTP 403).
+    // Each attempt runs yt-dlp again, which extracts fresh URLs.
+    with_retries(3, Duration::from_secs(2), &cancelled, || {
+        super::playback::run(&args, cancelled.clone(), Duration::from_secs(20 * 60))
+    })?;
     local_file(directory, &song.video_id).ok_or_else(|| "Download finished but the audio file could not be found".into())
 }
 
@@ -258,6 +277,21 @@ mod tests {
         for missing in ["two", "three", "x", "in"] { assert!(index.file(missing).is_none(), "{missing}"); }
         assert!(Index::scan(&directory.join("missing")).file("one").is_none());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_downloads_are_retried_until_the_limit() {
+        let cancelled = AtomicBool::new(false);
+        let mut calls = 0;
+        let result = with_retries(3, Duration::ZERO, &cancelled, || { calls += 1; if calls < 3 { Err("HTTP 403".to_owned()) } else { Ok(calls) } });
+        assert_eq!(result, Ok(3));
+        let mut calls = 0;
+        let result: Result<(), _> = with_retries(3, Duration::ZERO, &cancelled, || { calls += 1; Err(format!("failure {calls}")) });
+        assert_eq!(result, Err("failure 3".into()));
+        cancelled.store(true, Ordering::Relaxed);
+        let mut calls = 0;
+        let _: Result<(), _> = with_retries(3, Duration::ZERO, &cancelled, || { calls += 1; Err("cancelled".to_owned()) });
+        assert_eq!(calls, 1, "cancellation stops retries");
     }
 
     #[test]
