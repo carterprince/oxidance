@@ -13,8 +13,10 @@ Oxidance is an unofficial client and is not affiliated with YouTube or Google.
 
 ## Features
 
-- **Search:** find songs and artists. Results load as you scroll, and artist
-  pages show artwork, a biography, and top songs.
+- **Search:** find songs, artists, and albums. Suggestions appear as you type,
+  even for partial names, followed by full results that load as you scroll.
+  Artist pages show artwork, a biography, and top songs; album pages show the
+  artwork, artists, and track list.
 - **Library:** like songs and organize them into playlists. Your library is
   stored locally in `~/.local/share/oxidance/library.json`, not in a YouTube
   account.

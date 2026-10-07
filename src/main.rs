@@ -11,8 +11,8 @@ mod mpris;
 mod dav;
 mod sync;
 
-#[derive(Clone, Copy, PartialEq)]
-enum View { Search, Liked, Playlist(u64), Artist }
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum View { Search, Liked, Playlist(u64), Artist, Album }
 
 struct Ui {
     window: adw::ApplicationWindow,
@@ -40,12 +40,19 @@ struct Ui {
     biography_expanded: Cell<bool>,
     artist_error: RefCell<Option<String>>,
     artist_back: gtk::Button,
-    artist_previous: Cell<View>,
-    artist_previous_scroll: Cell<f64>,
-    artist_previous_filter: RefCell<String>,
+    album_results: RefCell<Vec<oxidance::artists::Album>>,
+    album_page: RefCell<Option<oxidance::artists::AlbumPage>>,
+    album_loading: Cell<bool>,
+    album_error: RefCell<Option<String>>,
+    /// Views to return to from artist and album pages, with their scroll position and filter.
+    history: RefCell<Vec<(View, f64, String)>>,
     generation: Cell<u64>,
     search_request: Cell<u64>,
     debounce: RefCell<Option<glib::SourceId>>,
+    suggest_debounce: RefCell<Option<glib::SourceId>>,
+    full_requested: Cell<bool>,
+    /// The visible results belong to the previous query and are replaced by the next results.
+    results_stale: Cell<bool>,
     query: RefCell<String>,
     cursor: RefCell<Option<oxidance::SearchCursor>>,
     page_loading: Cell<bool>,
@@ -325,10 +332,10 @@ impl Ui {
             view: Cell::new(View::Liked), results: RefCell::new(vec![]),
             artist_results: RefCell::new(vec![]), artist_profile: RefCell::new(None),
             artist_request: Cell::new(0), artist_loading: Cell::new(false), biography_expanded: Cell::new(false), artist_error: RefCell::new(None),
-            artist_back, artist_previous: Cell::new(View::Search),
-            artist_previous_scroll: Cell::new(0.0), artist_previous_filter: RefCell::new(String::new()),
+            artist_back, album_results: RefCell::new(vec![]), album_page: RefCell::new(None), album_loading: Cell::new(false),
+            album_error: RefCell::new(None), history: RefCell::new(vec![]),
             generation: Cell::new(0), search_request: Cell::new(0), art_cache: RefCell::new(HashMap::new()), saved_art: RefCell::new(HashMap::new()),
-            debounce: RefCell::new(None), query: RefCell::new(String::new()),
+            debounce: RefCell::new(None), suggest_debounce: RefCell::new(None), full_requested: Cell::new(false), results_stale: Cell::new(false), query: RefCell::new(String::new()),
             cursor: RefCell::new(None), page_loading: Cell::new(false), pagination_failed: Cell::new(false), pending_art: RefCell::new(vec![]),
             playback_bar, playback_art, sidebar_art, playback_button, playback_title,
             previous_button, next_button, shuffle_button, playback_queue: RefCell::new(vec![]),
@@ -628,12 +635,14 @@ impl Ui {
     fn navigate(self: &Rc<Self>, view: View) {
         self.artist_request.set(self.artist_request.get() + 1);
         if let Some(timer) = self.debounce.borrow_mut().take() { timer.remove(); }
+        if let Some(timer) = self.suggest_debounce.borrow_mut().take() { timer.remove(); }
+        if !matches!(view, View::Artist | View::Album) { self.history.borrow_mut().clear(); }
         self.search_request.set(self.search_request.get() + 1);
         self.page_loading.set(false);
         self.retry.set_visible(false);
         let previous_view = self.view.replace(view);
         if previous_view != view { self.collection_search.set_text(""); }
-        self.artist_back.set_visible(view == View::Artist);
+        self.artist_back.set_visible(matches!(view, View::Artist | View::Album));
         self.search_controls.set_visible_child_name(if view == View::Search { "search" } else { "title" });
         self.spinner.stop();
         self.spinner.set_visible(false);
@@ -827,6 +836,12 @@ impl Ui {
                     profile.songs.clone()
                 } else { self.title.set_text("Artist"); vec![] }
             }
+            View::Album => {
+                if let Some(page) = self.album_page.borrow().as_ref() {
+                    self.title.set_text(&page.album.title);
+                    page.songs.clone()
+                } else { self.title.set_text("Album"); vec![] }
+            }
         };
         let collection = matches!(self.view.get(), View::Liked | View::Playlist(_));
         self.collection_search.set_visible(collection);
@@ -839,18 +854,25 @@ impl Ui {
                 View::Playlist(_) => "This playlist is empty. Add songs with the + button on a song.".into(),
                 View::Artist => if self.artist_loading.get() { "Loading artist…".into() }
                     else { self.artist_error.borrow().clone().unwrap_or_else(|| "No top songs available.".into()) },
+                View::Album => if self.album_loading.get() { "Loading album…".into() }
+                    else { self.album_error.borrow().clone().unwrap_or_else(|| "No songs available.".into()) },
             }
         } else { format!("{} songs", songs.len()) });
-        if self.view.get() == View::Search && self.page_loading.get() {
+        let search = self.view.get() == View::Search;
+        if search && self.page_loading.get() {
             self.status.set_text("Searching YouTube Music…");
-        } else if self.view.get() == View::Search && !self.artist_results.borrow().is_empty() {
-            self.status.set_text(&format!("{} artists · {} songs", self.artist_results.borrow().len(), songs.len()));
+        } else if search && !(self.artist_results.borrow().is_empty() && self.album_results.borrow().is_empty()) {
+            self.status.set_text(&self.search_status());
         }
-        self.list.set_visible(!songs.is_empty() || self.view.get() == View::Artist || !self.artist_results.borrow().is_empty() && self.view.get() == View::Search);
-        if self.view.get() == View::Search {
+        self.list.set_visible(!songs.is_empty() || matches!(self.view.get(), View::Artist | View::Album)
+            || search && !(self.artist_results.borrow().is_empty() && self.album_results.borrow().is_empty()));
+        if search {
             for artist in self.artist_results.borrow().iter() { self.add_artist_result(artist); }
+            for album in self.album_results.borrow().iter() { self.add_album_result(album); }
         } else if self.view.get() == View::Artist {
             if let Some(profile) = self.artist_profile.borrow().as_ref() { self.add_artist_header(profile); }
+        } else if self.view.get() == View::Album {
+            if let Some(page) = self.album_page.borrow().as_ref() { self.add_album_header(page); }
         }
         let query = self.collection_search.text().trim().to_lowercase();
         let songs: Vec<Song> = songs.into_iter().filter(|song| {
@@ -866,20 +888,113 @@ impl Ui {
     }
 
     fn return_from_artist(self: &Rc<Self>) {
-        let view = self.artist_previous.get();
-        let position = self.artist_previous_scroll.get();
-        let filter = self.artist_previous_filter.borrow().clone();
+        let (view, position, filter) = self.history.borrow_mut().pop().unwrap_or((View::Search, 0.0, String::new()));
         self.navigate(view);
         self.collection_search.set_text(&filter);
         self.restore_scroll(position);
     }
 
-    fn open_artist(self: &Rc<Self>, artist: oxidance::ArtistLink) {
-        if self.view.get() != View::Artist {
-            self.artist_previous.set(self.view.get());
-            self.artist_previous_scroll.set(self.scroll.vadjustment().value());
-            *self.artist_previous_filter.borrow_mut() = self.collection_search.text().to_string();
+    /// Remembers the current view before opening an artist or album page. Moving
+    /// between pages of the same kind replaces the page instead of nesting it.
+    fn push_history(&self, page: View) {
+        if self.view.get() != page {
+            self.history.borrow_mut().push((self.view.get(), self.scroll.vadjustment().value(), self.collection_search.text().to_string()));
         }
+    }
+
+    fn open_album(self: &Rc<Self>, album: oxidance::artists::Album) {
+        self.push_history(View::Album);
+        self.navigate(View::Album);
+        self.album_loading.set(true);
+        self.album_error.borrow_mut().take();
+        self.album_page.borrow_mut().take();
+        self.spinner.set_visible(true);
+        self.spinner.start();
+        self.render();
+        self.title.set_text(&album.title);
+        self.scroll.vadjustment().set_value(0.0);
+        let request = self.artist_request.get();
+        let (sender, receiver) = async_channel::bounded(1);
+        let id = album.id.clone();
+        std::thread::spawn(move || { let _ = sender.send_blocking(oxidance::artists::album(&id).map_err(|error| error.to_string())); });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(result) = receiver.recv().await else { return; };
+            let Some(ui) = weak.upgrade() else { return; };
+            if ui.view.get() != View::Album || ui.artist_request.get() != request { return; }
+            ui.album_loading.set(false);
+            ui.spinner.stop();
+            ui.spinner.set_visible(false);
+            match result {
+                Ok(page) => { *ui.album_page.borrow_mut() = Some(page); }
+                Err(error) => { *ui.album_error.borrow_mut() = Some(format!("Could not load album: {error}")); }
+            }
+            ui.render();
+        });
+    }
+
+    fn add_album_result(self: &Rc<Self>, album: &oxidance::artists::Album) {
+        let row = adw::ActionRow::new();
+        row.set_use_markup(false);
+        row.set_title(&album.title);
+        row.set_subtitle(&album.subtitle);
+        row.set_activatable(true);
+        row.set_widget_name(&format!("album-{}", album.id));
+        let art = gtk::Image::from_icon_name("audio-x-generic-symbolic");
+        art.set_pixel_size(72);
+        art.set_size_request(72, 72);
+        art.set_margin_top(8);
+        art.set_margin_bottom(8);
+        row.add_prefix(&art);
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.connect_activated({ let weak = Rc::downgrade(self); let album = album.clone(); move |_| {
+            if let Some(ui) = weak.upgrade() { ui.open_album(album.clone()); }
+        }});
+        self.list.append(&row);
+        self.queue_art(&art, album.image_url.as_deref());
+    }
+
+    fn add_album_header(self: &Rc<Self>, page: &oxidance::artists::AlbumPage) {
+        let row = gtk::ListBoxRow::new();
+        row.set_activatable(false);
+        row.set_selectable(false);
+        let content = padded_box(16, 16);
+        let about = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+        let art = gtk::Image::from_icon_name("audio-x-generic-symbolic");
+        art.set_pixel_size(160);
+        art.set_size_request(160, 160);
+        art.set_valign(gtk::Align::Start);
+        about.append(&art);
+        let description = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        description.set_hexpand(true);
+        description.set_valign(gtk::Align::Center);
+        if !page.artists.is_empty() {
+            let markup = page.artists.iter().enumerate()
+                .map(|(index, artist)| format!("<a href=\"{index}\">{}</a>", glib::markup_escape_text(&artist.name)))
+                .collect::<Vec<_>>().join(", ");
+            let artists = gtk::Label::builder().label(markup).use_markup(true).xalign(0.0).wrap(true).build();
+            artists.add_css_class("title-4");
+            artists.connect_activate_link({ let weak = Rc::downgrade(self); let links = page.artists.clone(); move |_, href| {
+                if let (Some(ui), Some(artist)) = (weak.upgrade(), href.parse::<usize>().ok().and_then(|index| links.get(index))) {
+                    let artist = artist.clone();
+                    glib::idle_add_local_once(move || ui.open_artist(artist));
+                }
+                glib::Propagation::Stop
+            }});
+            description.append(&artists);
+        }
+        let details = gtk::Label::builder().label(&page.details).xalign(0.0).wrap(true).build();
+        details.add_css_class("dim-label");
+        description.append(&details);
+        about.append(&description);
+        content.append(&about);
+        row.set_child(Some(&content));
+        self.list.append(&row);
+        self.queue_art(&art, page.album.image_url.as_deref());
+    }
+
+    fn open_artist(self: &Rc<Self>, artist: oxidance::ArtistLink) {
+        self.push_history(View::Artist);
         self.navigate(View::Artist);
         self.artist_loading.set(true);
         self.biography_expanded.set(false);
@@ -1288,6 +1403,7 @@ impl Ui {
             View::Playlist(id) => self.library.borrow().playlists.iter().find(|p| p.id == id).map(|p| p.songs.clone()).unwrap_or_default(),
             View::Search => self.results.borrow().clone(),
             View::Artist => self.artist_profile.borrow().as_ref().map(|p| p.songs.clone()).unwrap_or_default(),
+            View::Album => self.album_page.borrow().as_ref().map(|page| page.songs.clone()).unwrap_or_default(),
         };
         if !queue.iter().any(|s| s.video_id == song.video_id) { queue.push(song.clone()); }
         *self.playback_order.borrow_mut() = (0..queue.len()).collect();
@@ -1560,6 +1676,7 @@ impl Ui {
 
     fn schedule_search(self: &Rc<Self>) {
         if let Some(timer) = self.debounce.borrow_mut().take() { timer.remove(); }
+        if let Some(timer) = self.suggest_debounce.borrow_mut().take() { timer.remove(); }
         self.search_request.set(self.search_request.get() + 1);
         self.page_loading.set(false);
         self.spinner.stop();
@@ -1567,39 +1684,134 @@ impl Ui {
         self.retry.set_visible(false);
         if self.entry.text().trim().is_empty() {
             self.cursor.borrow_mut().take();
-            self.results.borrow_mut().clear();
-            self.artist_results.borrow_mut().clear();
+            self.clear_results();
+            self.query.borrow_mut().clear();
             if self.view.get() == View::Search { self.render(); }
             return;
         }
+        // Suggestions are one small request and match partial words, so show them
+        // quickly; the full search waits until typing settles.
         let weak = Rc::downgrade(self);
-        let timer = glib::timeout_add_local_once(Duration::from_secs(1), move || {
+        *self.suggest_debounce.borrow_mut() = Some(glib::timeout_add_local_once(Duration::from_millis(200), move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.suggest_debounce.borrow_mut().take();
+                ui.suggest();
+            }
+        }));
+        let weak = Rc::downgrade(self);
+        *self.debounce.borrow_mut() = Some(glib::timeout_add_local_once(Duration::from_secs(1), move || {
             if let Some(ui) = weak.upgrade() {
                 ui.debounce.borrow_mut().take();
                 ui.search();
             }
-        });
-        *self.debounce.borrow_mut() = Some(timer);
+        }));
+    }
+
+    /// Starts a new query. The previous results stay visible until the first new
+    /// results arrive, so the list does not flash empty while typing.
+    fn begin_query(self: &Rc<Self>, query: &str) {
+        self.search_request.set(self.search_request.get() + 1);
+        *self.query.borrow_mut() = query.to_owned();
+        self.cursor.borrow_mut().take();
+        self.full_requested.set(false);
+        self.pagination_failed.set(false);
+        self.results_stale.set(true);
+        if self.view.get() != View::Search {
+            self.view.set(View::Search);
+            self.history.borrow_mut().clear();
+            self.artist_back.set_visible(false);
+            self.artist_request.set(self.artist_request.get() + 1);
+            self.clear_results();
+            self.refresh_sidebar();
+            self.render();
+        }
+        if self.split.is_collapsed() { self.split.set_show_sidebar(false); }
+    }
+
+    fn clear_results(&self) {
+        self.results.borrow_mut().clear();
+        self.artist_results.borrow_mut().clear();
+        self.album_results.borrow_mut().clear();
+        self.results_stale.set(false);
+    }
+
+    fn suggest(self: &Rc<Self>) {
+        let query = self.entry.text().trim().to_owned();
+        if query.is_empty() { return; }
+        self.begin_query(&query);
+        self.fetch_suggestions();
     }
 
     fn search(self: &Rc<Self>) {
         if let Some(timer) = self.debounce.borrow_mut().take() { timer.remove(); }
+        if let Some(timer) = self.suggest_debounce.borrow_mut().take() { timer.remove(); }
         let query = self.entry.text().trim().to_owned();
         if query.is_empty() { return; }
-        self.search_request.set(self.search_request.get() + 1);
-        *self.query.borrow_mut() = query;
-        self.cursor.borrow_mut().take();
-        self.view.set(View::Search);
-        self.artist_back.set_visible(false);
-        self.artist_request.set(self.artist_request.get() + 1);
-        self.results.borrow_mut().clear();
-        self.artist_results.borrow_mut().clear();
-        self.pagination_failed.set(false);
-        self.refresh_sidebar();
-        self.render();
-        self.scroll.vadjustment().set_value(0.0);
-        if self.split.is_collapsed() { self.split.set_show_sidebar(false); }
+        // Keep suggestions already shown for this query; start over for a new query or a repeated search.
+        if *self.query.borrow() != query || self.full_requested.get() || self.view.get() != View::Search {
+            self.begin_query(&query);
+            self.fetch_suggestions();
+        }
+        self.full_requested.set(true);
         self.fetch_page(false);
+    }
+
+    fn fetch_suggestions(self: &Rc<Self>) {
+        let request = self.search_request.get();
+        let query = self.query.borrow().clone();
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || { let _ = sender.send_blocking(oxidance::artists::suggestions(&query).map_err(|error| error.to_string())); });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(result) = receiver.recv().await else { return; };
+            let Some(ui) = weak.upgrade() else { return; };
+            if ui.search_request.get() != request || ui.view.get() != View::Search { return; }
+            // Suggestions are optional; the full search reports its own errors.
+            let Ok(suggestions) = result else { return; };
+            ui.merge_results(suggestions.artists, suggestions.albums, suggestions.songs, true);
+            if !ui.page_loading.get() { ui.status.set_text(&ui.search_status()); }
+        });
+    }
+
+    /// Adds results without duplicates. Suggestions go first because they match partial words.
+    fn merge_results(self: &Rc<Self>, artists: Vec<oxidance::artists::Artist>, albums: Vec<oxidance::artists::Album>, songs: Vec<Song>, first: bool) {
+        fn merge<T: Clone>(current: &mut Vec<T>, new: Vec<T>, first: bool, same: impl Fn(&T, &T) -> bool) {
+            let new: Vec<T> = new.into_iter().filter(|item| !current.iter().any(|saved| same(saved, item))).collect();
+            if first { current.splice(0..0, new); } else { current.extend(new); }
+        }
+        let replacing = self.results_stale.get();
+        if replacing { self.clear_results(); }
+        let query = self.query.borrow().to_lowercase();
+        {
+            let mut current = self.artist_results.borrow_mut();
+            merge(&mut current, artists, first, |a, b| a.link.id == b.link.id);
+            current.sort_by_key(|artist| artist.link.name.trim().to_lowercase() != query);
+            current.truncate(5);
+        }
+        {
+            let mut current = self.album_results.borrow_mut();
+            merge(&mut current, albums, first, |a, b| a.id == b.id);
+            current.truncate(3);
+        }
+        merge(&mut self.results.borrow_mut(), songs, first, |a, b| a.video_id == b.video_id);
+        if replacing {
+            self.render();
+            self.scroll.vadjustment().set_value(0.0);
+        } else { self.render_preserving_scroll(); }
+    }
+
+    fn search_status(&self) -> String {
+        let count = |number: usize, one: &str, many: &str| format!("{number} {}", if number == 1 { one } else { many });
+        let (artists, albums, songs) = (self.artist_results.borrow().len(), self.album_results.borrow().len(), self.results.borrow().len());
+        if artists + albums + songs == 0 { return "No results found. Try another query.".into(); }
+        let mut parts = Vec::new();
+        if artists > 0 { parts.push(count(artists, "artist", "artists")); }
+        if albums > 0 { parts.push(count(albums, "album", "albums")); }
+        parts.push(count(songs, "song", "songs"));
+        if self.full_requested.get() && !self.page_loading.get() && self.cursor.borrow().is_none() && !self.pagination_failed.get() {
+            parts.push("End of results".into());
+        }
+        parts.join(" · ")
     }
 
     fn maybe_load_more(self: &Rc<Self>) {
@@ -1628,9 +1840,16 @@ impl Ui {
         self.status.set_text(if append { "Loading more songs…" } else { "Searching YouTube Music…" });
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let artists = if append { Ok(vec![]) } else { oxidance::artists::search(&query).map_err(|error| error.to_string()) };
-            let result = oxidance::search_page(&query, cursor).map(|page| (page, artists)).map_err(|error| error.to_string());
-            let _ = sender.send_blocking(result);
+            let (artists, albums, page) = std::thread::scope(|scope| {
+                let artists = (!append).then(|| scope.spawn(|| oxidance::artists::search(&query).map_err(|error| error.to_string())));
+                let albums = (!append).then(|| scope.spawn(|| oxidance::artists::search_albums(&query).map_err(|error| error.to_string())));
+                let page = oxidance::search_page(&query, cursor).map_err(|error| error.to_string());
+                fn join<T>(handle: Option<std::thread::ScopedJoinHandle<'_, Result<T, String>>>) -> Option<Result<T, String>> {
+                    handle.map(|handle| handle.join().unwrap_or_else(|_| Err("Search failed".into())))
+                }
+                (join(artists), join(albums), page)
+            });
+            let _ = sender.send_blocking(page.map(|page| (page, artists, albums)));
         });
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -1641,28 +1860,25 @@ impl Ui {
             ui.spinner.stop();
             ui.spinner.set_visible(false);
             match result {
-                Ok((page, artists)) => {
+                Ok((page, artists, albums)) => {
                     *ui.cursor.borrow_mut() = page.next;
-                    if !append {
-                        match artists {
-                            Ok(artists) => {
-                                *ui.artist_results.borrow_mut() = artists;
-                                for artist in ui.artist_results.borrow().iter() { ui.add_artist_result(artist); }
-                            }
-                            Err(error) => ui.toast(&format!("Artist search unavailable: {error}")),
-                        }
+                    if append {
+                        let songs: Vec<Song> = page.songs.into_iter()
+                            .filter(|song| !ui.results.borrow().iter().any(|saved| saved.video_id == song.video_id)).collect();
+                        ui.results.borrow_mut().extend(songs.clone());
+                        ui.append_songs(&songs);
+                    } else {
+                        let artists = artists.unwrap_or(Ok(vec![])).unwrap_or_else(|error| {
+                            ui.toast(&format!("Artist search unavailable: {error}"));
+                            vec![]
+                        });
+                        let albums = albums.unwrap_or(Ok(vec![])).unwrap_or_default();
+                        ui.merge_results(artists, albums, page.songs, false);
                     }
-                    ui.results.borrow_mut().extend(page.songs.clone());
-                    ui.list.set_visible(!ui.results.borrow().is_empty() || !ui.artist_results.borrow().is_empty());
-                    ui.append_songs(&page.songs);
-                    let count = ui.results.borrow().len();
-                    let artist_count = ui.artist_results.borrow().len();
-                    ui.status.set_text(&if artist_count > 0 { format!("{artist_count} artists · {count} songs") }
-                        else if count == 0 { "No songs found. Try another query.".into() }
-                        else if ui.cursor.borrow().is_none() { format!("{count} songs · End of results") }
-                        else { format!("{count} songs") });
+                    ui.status.set_text(&ui.search_status());
                 }
                 Err(error) => {
+                    if ui.results_stale.get() { ui.clear_results(); ui.render(); }
                     ui.pagination_failed.set(true);
                     ui.retry.set_visible(true);
                     ui.status.set_text(&format!("Could not fetch songs: {error}"));
@@ -1774,12 +1990,93 @@ mod tests {
         let position = ui.scroll.vadjustment().value();
         assert!(position > 0.0);
         ui.open_artist(oxidance::ArtistLink { id: "UCmissing".into(), name: "Artist".into() });
-        assert_eq!(ui.artist_previous_scroll.get(), position);
+        assert_eq!(ui.history.borrow().last().map(|(view, scroll, _)| (*view, *scroll)), Some((View::Liked, position)));
         ui.artist_back.emit_clicked();
         settle();
         assert!(ui.view.get() == View::Liked);
         assert_eq!(ui.collection_search.text(), "Track");
         assert!((ui.scroll.vadjustment().value() - position).abs() < 1.0, "Back must restore the collection scroll position");
+        ui.window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a desktop display and live YouTube Music access"]
+    fn ui_live_partial_query_suggestions() {
+        adw::init().unwrap();
+        let app = adw::Application::builder().application_id("io.github.oxidance.SuggestTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let ui = Ui::new(&app, std::env::temp_dir().join(format!("oxidance-suggest-test-{}/library.json", std::process::id())));
+        ui.navigate(View::Search);
+        let started = std::time::Instant::now();
+        ui.entry.set_text("piero pi");
+        let has_artist = || ui.artist_results.borrow().iter().any(|artist| artist.link.name == "Piero Piccioni");
+        while !has_artist() && started.elapsed() < Duration::from_secs(20) { pump(); std::thread::sleep(Duration::from_millis(5)); }
+        assert!(has_artist(), "a partial name finds the artist through suggestions");
+        assert!(!ui.full_requested.get(), "suggestions arrive before the full search starts ({:?})", started.elapsed());
+        let suggested = ui.results.borrow().len();
+        while !(ui.full_requested.get() && !ui.page_loading.get()) && started.elapsed() < Duration::from_secs(45) { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        assert!(ui.results.borrow().len() > suggested, "full results follow the suggestions");
+        let mut ids = std::collections::HashSet::new();
+        assert!(ui.results.borrow().iter().all(|song| ids.insert(song.video_id.clone())), "no duplicate songs");
+        ui.window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a desktop display"]
+    fn ui_search_merging_and_album_pages() {
+        adw::init().unwrap();
+        let app = adw::Application::builder().application_id("io.github.oxidance.AlbumTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let ui = Ui::new(&app, std::env::temp_dir().join(format!("oxidance-album-test-{}/library.json", std::process::id())));
+        let song = |id: &str| Song { video_id: id.into(), title: format!("Track {id}"), artist: None, album_art_url: None, artists: vec![] };
+        let artist = |id: &str, name: &str| oxidance::artists::Artist { link: oxidance::ArtistLink { id: id.into(), name: name.into() }, image_url: None };
+        let album = |id: &str| oxidance::artists::Album { id: id.into(), title: format!("Album {id}"), subtitle: "Album • Artist • 2022".into(), image_url: None };
+        // Suggestions appear first; full results are appended without duplicates.
+        ui.navigate(View::Search);
+        ui.results.borrow_mut().push(song("old"));
+        ui.begin_query("piero piccioni");
+        assert_eq!(ui.results.borrow().len(), 1, "previous results stay until new ones arrive");
+        ui.merge_results(vec![artist("UCpiero", "Piero Piccioni")], vec![album("hits")], vec![song("a"), song("b")], true);
+        ui.merge_results(vec![artist("UCother", "Other"), artist("UCpiero", "Piero Piccioni")], vec![album("hits"), album("live")],
+            vec![song("b"), song("c")], false);
+        let ids = |songs: &[Song]| songs.iter().map(|song| song.video_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&ui.results.borrow()), ["a", "b", "c"]);
+        assert_eq!(ui.artist_results.borrow().iter().map(|artist| artist.link.id.as_str()).collect::<Vec<_>>(), ["UCpiero", "UCother"]);
+        assert_eq!(ui.album_results.borrow().len(), 2);
+        assert_eq!(ui.search_status(), "2 artists · 2 albums · 3 songs");
+        let rows = descendants(ui.list.upcast_ref());
+        assert!(rows.iter().any(|widget| widget.widget_name() == "album-hits"), "album results are listed");
+        // Album pages show their artists and play their tracks as a queue.
+        ui.push_history(View::Album);
+        ui.navigate(View::Album);
+        *ui.album_page.borrow_mut() = Some(oxidance::artists::AlbumPage {
+            album: album("hits"), artists: vec![oxidance::ArtistLink { id: "UCpiero".into(), name: "Piero Piccioni".into() }],
+            details: "Album • 2022 · 2 songs • 7 minutes".into(), songs: vec![song("one"), song("two")] });
+        ui.render();
+        assert_eq!(ui.title.text(), "Album hits");
+        assert!(ui.artist_back.is_visible());
+        let labels = descendants(ui.list.upcast_ref()).into_iter().filter_map(|widget| widget.downcast::<gtk::Label>().ok())
+            .map(|label| label.label().to_string()).collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| label.contains("Piero Piccioni") && label.contains("<a href")), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "Album • 2022 · 2 songs • 7 minutes"));
+        ui.play_song(&song("two"));
+        assert_eq!(ids(&ui.playback_queue.borrow()), ["one", "two"]);
+        ui.stop_player();
+        // Back from an artist opened on the album page returns to the album, then to search.
+        ui.open_artist(oxidance::ArtistLink { id: "UCpiero".into(), name: "Piero Piccioni".into() });
+        assert_eq!(ui.history.borrow().len(), 2);
+        ui.artist_back.emit_clicked();
+        assert!(ui.view.get() == View::Album && ui.album_page.borrow().is_some());
+        ui.artist_back.emit_clicked();
+        assert!(ui.view.get() == View::Search);
+        assert_eq!(ids(&ui.results.borrow()), ["a", "b", "c"]);
+        // A new query replaces the old results once its first results arrive.
+        ui.begin_query("another");
+        ui.merge_results(vec![], vec![], vec![song("x")], true);
+        assert_eq!(ids(&ui.results.borrow()), ["x"]);
+        assert!(ui.artist_results.borrow().is_empty() && ui.album_results.borrow().is_empty());
         ui.window.close();
     }
 

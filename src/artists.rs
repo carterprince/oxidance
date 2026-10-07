@@ -9,6 +9,32 @@ pub struct Artist {
 }
 
 #[derive(Clone, Debug)]
+pub struct Album {
+    pub id: String,
+    pub title: String,
+    /// Kind, artist, and year as YouTube Music shows them, e.g. "Album • Piero Piccioni • 2022".
+    pub subtitle: String,
+    pub image_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AlbumPage {
+    pub album: Album,
+    pub artists: Vec<ArtistLink>,
+    /// Kind, year, and length, e.g. "Album • 2022 · 40 songs • 2 hours, 6 minutes".
+    pub details: String,
+    pub songs: Vec<Song>,
+}
+
+/// Search-as-you-type entries. Unlike filtered search, these match partial words.
+#[derive(Clone, Debug, Default)]
+pub struct Suggestions {
+    pub artists: Vec<Artist>,
+    pub albums: Vec<Album>,
+    pub songs: Vec<Song>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Profile {
     pub artist: Artist,
     pub biography: Option<String>,
@@ -74,6 +100,105 @@ fn parse_search(response: &Value, query: &str) -> Vec<Artist> {
     artists.sort_by_key(|artist| artist.link.name.trim().to_lowercase() != query.trim().to_lowercase());
     artists.truncate(5);
     artists
+}
+
+fn page_type(row: &Value) -> Option<&str> {
+    row.pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+        .and_then(Value::as_str)
+}
+
+fn column(row: &Value, index: usize) -> String {
+    text(&row["flexColumns"][index]["musicResponsiveListItemFlexColumnRenderer"]["text"])
+}
+
+fn parse_album(row: &Value) -> Option<Album> {
+    let id = row.pointer("/navigationEndpoint/browseEndpoint/browseId").and_then(Value::as_str)?;
+    let title = column(row, 0);
+    if !id.starts_with("MPRE") || title.is_empty() { return None; }
+    Some(Album { id: id.to_owned(), title, subtitle: column(row, 1),
+        image_url: image_url(&row["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]) })
+}
+
+fn parse_suggestions(response: &Value) -> Suggestions {
+    let mut rows = Vec::new();
+    collect(&response["contents"], "musicResponsiveListItemRenderer", &mut rows);
+    let mut suggestions = Suggestions::default();
+    for row in rows {
+        match page_type(row) {
+            Some("MUSIC_PAGE_TYPE_ARTIST") => {
+                let id = row.pointer("/navigationEndpoint/browseEndpoint/browseId").and_then(Value::as_str).unwrap_or("");
+                let name = column(row, 0);
+                if id.starts_with("UC") && !name.is_empty() {
+                    suggestions.artists.push(Artist { link: ArtistLink { id: id.to_owned(), name },
+                        image_url: image_url(&row["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]) });
+                }
+            }
+            Some("MUSIC_PAGE_TYPE_ALBUM") => suggestions.albums.extend(parse_album(row)),
+            // Audio tracks only, matching the Songs search filter; skip music videos and uploads.
+            _ if row.pointer("/navigationEndpoint/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType")
+                .and_then(Value::as_str) == Some("MUSIC_VIDEO_TYPE_ATV") => suggestions.songs.extend(parse_song(row)),
+            _ => {}
+        }
+    }
+    suggestions
+}
+
+pub fn suggestions(query: &str) -> Result<Suggestions, Box<dyn Error>> {
+    Ok(parse_suggestions(&request("music/get_search_suggestions", json!({"input": query}))?))
+}
+
+pub fn search_albums(query: &str) -> Result<Vec<Album>, Box<dyn Error>> {
+    let response = request("search", json!({"query": query, "params": "EgWKAQIYAWoMEA4QChADEAQQCRAF"}))?;
+    let mut rows = Vec::new();
+    collect(&response["contents"], "musicResponsiveListItemRenderer", &mut rows);
+    let mut albums: Vec<Album> = Vec::new();
+    for album in rows.into_iter().filter_map(parse_album) {
+        if !albums.iter().any(|saved| saved.id == album.id) { albums.push(album); }
+    }
+    albums.truncate(3);
+    Ok(albums)
+}
+
+fn parse_album_page(response: &Value, id: &str) -> Result<AlbumPage, Box<dyn Error>> {
+    let mut headers = Vec::new();
+    collect(&response["contents"], "musicResponsiveHeaderRenderer", &mut headers);
+    let header = headers.first().ok_or("Album is unavailable or has an unsupported layout")?;
+    let title = text(&header["title"]);
+    if title.is_empty() { return Err("Album has no title".into()); }
+    let artists: Vec<ArtistLink> = header.pointer("/straplineTextOne/runs").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|run| {
+            let id = run.pointer("/navigationEndpoint/browseEndpoint/browseId").and_then(Value::as_str)?;
+            Some(ArtistLink { id: id.to_owned(), name: run["text"].as_str()?.to_owned() })
+        }).collect();
+    let artist_names = if artists.is_empty() { text(&header["straplineTextOne"]) }
+        else { artists.iter().map(|artist| artist.name.as_str()).collect::<Vec<_>>().join(", ") };
+    let kind = text(&header["subtitle"]);
+    let details = [kind.as_str(), &text(&header["secondSubtitle"])].into_iter().filter(|part| !part.is_empty())
+        .collect::<Vec<_>>().join(" · ");
+    let mut thumbnails = Vec::new();
+    collect(&header["thumbnail"], "thumbnails", &mut thumbnails);
+    let album = Album { id: id.to_owned(), title, subtitle: [kind.split(" • ").next().unwrap_or(""), &artist_names].into_iter()
+            .filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" • "),
+        image_url: thumbnails.first().and_then(|images| image_url(images)) };
+    let mut shelves = Vec::new();
+    collect(&response["contents"], "musicShelfRenderer", &mut shelves);
+    let mut songs = Vec::new();
+    for row in shelves.iter().filter_map(|shelf| shelf["contents"].as_array()).flatten() {
+        // Unavailable tracks have no video and are skipped.
+        let Some(mut song) = parse_song(&row["musicResponsiveListItemRenderer"]) else { continue; };
+        if song.artists.is_empty() && !artists.is_empty() {
+            song.artist = Some(artist_names.clone());
+            song.artists = artists.clone();
+        }
+        // Album tracks have no artwork of their own.
+        if song.album_art_url.is_none() { song.album_art_url = album.image_url.clone(); }
+        if !songs.iter().any(|saved: &Song| saved.video_id == song.video_id) { songs.push(song); }
+    }
+    Ok(AlbumPage { album, artists, details, songs })
+}
+
+pub fn album(id: &str) -> Result<AlbumPage, Box<dyn Error>> {
+    parse_album_page(&request("browse", json!({"browseId": id}))?, id)
 }
 
 pub fn search(query: &str) -> Result<Vec<Artist>, Box<dyn Error>> {
@@ -177,6 +302,94 @@ mod tests {
         let artists = parse_search(&response, " nujabes ");
         assert_eq!(artists.len(), 2);
         assert_eq!(artists[0].link.name, "Nujabes");
+    }
+
+    fn suggestion_row(title: &str, subtitle: Value, navigation: Value) -> Value {
+        json!({"musicResponsiveListItemRenderer": {
+            "navigationEndpoint": navigation,
+            "playlistItemData": navigation.pointer("/watchEndpoint/videoId").map(|id| json!({"videoId": id})),
+            "flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": title}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": subtitle}}}
+            ]
+        }})
+    }
+
+    fn browse(id: &str, page: &str) -> Value {
+        json!({"browseEndpoint": {"browseId": id, "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": page}}}})
+    }
+
+    fn watch(id: &str, kind: &str) -> Value {
+        json!({"watchEndpoint": {"videoId": id, "watchEndpointMusicSupportedConfigs": {"watchEndpointMusicConfig": {"musicVideoType": kind}}}})
+    }
+
+    #[test]
+    fn suggestions_keep_artists_albums_and_songs() {
+        let artist_run = json!([{"text": "Song"}, {"text": " • "}, {"text": "Piero Piccioni", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCpiero"}}}]);
+        let response = json!({"contents": [{"searchSuggestionsSectionRenderer": {"contents": [
+            suggestion_row("Piero Piccioni", json!([{"text": "101M monthly audience"}]), browse("UCpiero", "MUSIC_PAGE_TYPE_ARTIST")),
+            suggestion_row("Greatest Hits", json!([{"text": "Album • Piero Piccioni • 2022"}]), browse("MPREb_hits", "MUSIC_PAGE_TYPE_ALBUM")),
+            suggestion_row("Easy Lovers", artist_run, watch("easy", "MUSIC_VIDEO_TYPE_ATV")),
+            suggestion_row("Live video", json!([{"text": "Video • 1M views"}]), watch("video", "MUSIC_VIDEO_TYPE_OMV")),
+            suggestion_row("Mix", json!([{"text": "Playlist • YouTube Music"}]), browse("VLmix", "MUSIC_PAGE_TYPE_PLAYLIST")),
+        ]}}]});
+        let suggestions = parse_suggestions(&response);
+        assert_eq!(suggestions.artists.iter().map(|artist| artist.link.id.as_str()).collect::<Vec<_>>(), ["UCpiero"]);
+        assert_eq!(suggestions.albums.len(), 1);
+        assert_eq!(suggestions.albums[0].subtitle, "Album • Piero Piccioni • 2022");
+        assert_eq!(suggestions.songs.len(), 1, "music videos and playlists are skipped");
+        assert_eq!(suggestions.songs[0].artists[0].name, "Piero Piccioni");
+    }
+
+    #[test]
+    fn album_page_fills_track_artists_and_artwork() {
+        let track = |id: &str, title: &str, artists: Value| json!({"musicResponsiveListItemRenderer": {
+            "playlistItemData": {"videoId": id},
+            "flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": title}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": artists}}}
+            ]
+        }});
+        let unavailable = json!({"musicResponsiveListItemRenderer": {"flexColumns": [
+            {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Gone"}]}}}]}});
+        let response = json!({"contents": {"twoColumnBrowseResultsRenderer": {
+            "tabs": [{"content": {"musicResponsiveHeaderRenderer": {
+                "title": {"runs": [{"text": "Greatest Hits"}]},
+                "subtitle": {"runs": [{"text": "Album • 2022"}]},
+                "straplineTextOne": {"runs": [{"text": "Piero Piccioni", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCpiero"}}}]},
+                "secondSubtitle": {"runs": [{"text": "2 songs • 7 minutes"}]},
+                "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [
+                    {"url": "https://example.com/small.jpg", "width": 60, "height": 60},
+                    {"url": "https://example.com/large.jpg", "width": 544, "height": 544}]}}}
+            }}}],
+            "secondaryContents": {"sectionListRenderer": {"contents": [{"musicShelfRenderer": {"contents": [
+                track("one", "Easy Lovers", json!([])),
+                unavailable,
+                track("two", "Duet", json!([{"text": "Guest", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCguest"}}}])),
+            ]}}]}}
+        }}});
+        let page = parse_album_page(&response, "MPREb_hits").unwrap();
+        assert_eq!(page.album.title, "Greatest Hits");
+        assert_eq!(page.album.subtitle, "Album • Piero Piccioni");
+        assert_eq!(page.details, "Album • 2022 · 2 songs • 7 minutes");
+        assert_eq!(page.album.image_url.as_deref(), Some("https://example.com/large.jpg"));
+        assert_eq!(page.songs.len(), 2, "unavailable tracks are skipped");
+        assert_eq!(page.songs[0].artist.as_deref(), Some("Piero Piccioni"));
+        assert_eq!(page.songs[0].artists[0].id, "UCpiero");
+        assert_eq!(page.songs[1].artist.as_deref(), Some("Guest"));
+        assert!(page.songs.iter().all(|song| song.album_art_url.as_deref() == Some("https://example.com/large.jpg")));
+    }
+
+    #[test]
+    #[ignore = "requires live YouTube Music access"]
+    fn live_suggestions_and_album() {
+        let suggestions = suggestions("piero pi").unwrap();
+        assert!(suggestions.artists.iter().any(|artist| artist.link.name == "Piero Piccioni"), "{suggestions:?}");
+        let albums = search_albums("piero piccioni").unwrap();
+        assert!(!albums.is_empty());
+        let page = album(&albums[0].id).unwrap();
+        assert!(!page.songs.is_empty());
+        assert!(page.songs.iter().all(|song| !song.artists.is_empty() && song.album_art_url.is_some()));
     }
 
     #[test]
