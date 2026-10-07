@@ -163,7 +163,6 @@ impl Ui {
         entry.set_width_chars(32);
         controls.append(&entry);
         header_title.add_named(&controls, Some("search"));
-        header_title.set_visible_child_name("search");
         let title = gtk::Label::builder().label("Search results").xalign(0.0).build();
         title.add_css_class("title-2");
         content.append(&title);
@@ -1855,6 +1854,7 @@ mod tests {
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let ui = Ui::new(&app, std::env::temp_dir().join(format!("oxidance-collection-test-{}/library.json", std::process::id())));
+        assert_eq!(ui.search_controls.visible_child_name().as_deref(), Some("title"), "search stays hidden until requested");
         let first = Song { video_id: "first".into(), title: "Blind Spots".into(), artist: Some("C418".into()), album_art_url: None, artists: vec![] };
         let second = Song { video_id: "second".into(), title: "By and By".into(), artist: Some("nitsua".into()), album_art_url: None, artists: vec![] };
         ui.library.borrow_mut().liked = vec![first.clone(), second];
@@ -2133,6 +2133,7 @@ mod tests {
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let directory = std::env::temp_dir().join(format!("oxidance-artist-test-{}", std::process::id()));
         let ui = Ui::new(&app, directory.join("library.json"));
+        ui.navigate(View::Search);
         ui.entry.set_text("nujabes");
         ui.entry.grab_focus();
         ui.entry.set_position(3);
