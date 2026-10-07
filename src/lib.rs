@@ -6,6 +6,22 @@ use serde_json::{Value, json};
 pub mod library;
 pub mod artists;
 
+/// Lowercase words, ignoring punctuation and other symbols.
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase().split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty()).map(str::to_owned).collect()
+}
+
+/// How many of the query's words appear in `text`. The last word may be
+/// incomplete, so it also matches as a prefix.
+pub fn match_score(query: &str, text: &str) -> usize {
+    let query = words(query);
+    let text = words(text);
+    query.iter().enumerate().filter(|(index, word)| text.iter().any(|candidate| {
+        candidate == *word || *index == query.len() - 1 && candidate.starts_with(word.as_str())
+    })).count()
+}
+
 /// Requests a Google-hosted image at `size` pixels, keeping its other options. In
 /// particular, `p` crops to the requested square; without it, wide images stay wide.
 pub(crate) fn resize_google_image(url: &str, size: u32) -> String {
@@ -217,6 +233,18 @@ mod tests {
                 {"url": "https://example.com/large.jpg", "width": 120, "height": 120}
             ]}}}
         })
+    }
+
+    #[test]
+    fn match_score_counts_query_words_in_the_text() {
+        let query = "haruka nakamura let go";
+        assert_eq!(match_score(query, "let go (feat. Nujabes) haruka nakamura"), 4);
+        assert_eq!(match_score(query, "haruka nakamura"), 2);
+        assert_eq!(match_score(query, "MELODICA Album • haruka nakamura • 2013"), 2);
+        assert_eq!(match_score("piero pi", "Piero Piccioni"), 2, "the last word matches as a prefix");
+        assert_eq!(match_score("pi piero", "Piccioni"), 0, "earlier words must be complete");
+        assert_eq!(match_score("Café, del-mar!", "cafe del mar"), 2, "punctuation is ignored, accents are not");
+        assert_eq!(match_score("", "anything"), 0);
     }
 
     #[test]

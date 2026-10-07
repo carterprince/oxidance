@@ -26,12 +26,32 @@ pub struct AlbumPage {
     pub songs: Vec<Song>,
 }
 
-/// A search-as-you-type entry. Unlike filtered search, suggestions match partial words.
+/// One search result: a suggestion or a full search result.
 #[derive(Clone, Debug)]
-pub enum Suggestion {
+pub enum SearchItem {
     Artist(Artist),
     Album(Album),
     Song(Song),
+}
+
+impl SearchItem {
+    /// The words a query is matched against: names, titles, and artists.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Artist(artist) => artist.link.name.clone(),
+            Self::Album(album) => format!("{} {}", album.title, album.subtitle),
+            Self::Song(song) => format!("{} {}", song.title, song.artist.as_deref().unwrap_or("")),
+        }
+    }
+
+    pub fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Artist(a), Self::Artist(b)) => a.link.id == b.link.id,
+            (Self::Album(a), Self::Album(b)) => a.id == b.id,
+            (Self::Song(a), Self::Song(b)) => a.video_id == b.video_id,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -115,25 +135,25 @@ fn parse_album(row: &Value) -> Option<Album> {
 }
 
 /// Suggestions in YouTube Music's order, keeping artists, albums, and songs.
-fn parse_suggestions(response: &Value) -> Vec<Suggestion> {
+fn parse_suggestions(response: &Value) -> Vec<SearchItem> {
     let mut rows = Vec::new();
     collect(&response["contents"], "musicResponsiveListItemRenderer", &mut rows);
     rows.into_iter().filter_map(|row| match page_type(row) {
         Some("MUSIC_PAGE_TYPE_ARTIST") => {
             let id = row.pointer("/navigationEndpoint/browseEndpoint/browseId").and_then(Value::as_str)?;
             let name = column(row, 0);
-            (id.starts_with("UC") && !name.is_empty()).then(|| Suggestion::Artist(Artist { link: ArtistLink { id: id.to_owned(), name },
+            (id.starts_with("UC") && !name.is_empty()).then(|| SearchItem::Artist(Artist { link: ArtistLink { id: id.to_owned(), name },
                 image_url: image_url(&row["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]) }))
         }
-        Some("MUSIC_PAGE_TYPE_ALBUM") => parse_album(row).map(Suggestion::Album),
+        Some("MUSIC_PAGE_TYPE_ALBUM") => parse_album(row).map(SearchItem::Album),
         // Audio tracks only, matching the Songs search filter; skip music videos and uploads.
         _ if row.pointer("/navigationEndpoint/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType")
-            .and_then(Value::as_str) == Some("MUSIC_VIDEO_TYPE_ATV") => parse_song(row).map(Suggestion::Song),
+            .and_then(Value::as_str) == Some("MUSIC_VIDEO_TYPE_ATV") => parse_song(row).map(SearchItem::Song),
         _ => None,
     }).collect()
 }
 
-pub fn suggestions(query: &str) -> Result<Vec<Suggestion>, Box<dyn Error>> {
+pub fn suggestions(query: &str) -> Result<Vec<SearchItem>, Box<dyn Error>> {
     Ok(parse_suggestions(&request("music/get_search_suggestions", json!({"input": query}))?))
 }
 
@@ -324,9 +344,9 @@ mod tests {
         ]}}]});
         let suggestions = parse_suggestions(&response);
         assert_eq!(suggestions.len(), 3, "music videos and playlists are skipped");
-        assert!(matches!(&suggestions[0], Suggestion::Artist(artist) if artist.link.id == "UCpiero"));
-        assert!(matches!(&suggestions[1], Suggestion::Album(album) if album.subtitle == "Album • Piero Piccioni • 2022"));
-        assert!(matches!(&suggestions[2], Suggestion::Song(song) if song.artists[0].name == "Piero Piccioni"));
+        assert!(matches!(&suggestions[0], SearchItem::Artist(artist) if artist.link.id == "UCpiero"));
+        assert!(matches!(&suggestions[1], SearchItem::Album(album) if album.subtitle == "Album • Piero Piccioni • 2022"));
+        assert!(matches!(&suggestions[2], SearchItem::Song(song) if song.artists[0].name == "Piero Piccioni"));
     }
 
     #[test]
@@ -372,7 +392,7 @@ mod tests {
     #[ignore = "requires live YouTube Music access"]
     fn live_suggestions_and_album() {
         let suggestions = suggestions("piero pi").unwrap();
-        assert!(suggestions.iter().any(|item| matches!(item, Suggestion::Artist(artist) if artist.link.name == "Piero Piccioni")), "{suggestions:?}");
+        assert!(suggestions.iter().any(|item| matches!(item, SearchItem::Artist(artist) if artist.link.name == "Piero Piccioni")), "{suggestions:?}");
         let albums = search_albums("piero piccioni").unwrap();
         assert!(!albums.is_empty());
         let page = album(&albums[0].id).unwrap();
