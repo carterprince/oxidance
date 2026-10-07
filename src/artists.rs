@@ -1,6 +1,6 @@
 use std::{error::Error, time::Duration};
 use serde_json::{Value, json};
-use crate::{ArtistLink, Song, parse_song, text};
+use crate::{ArtistLink, Song, parse_song, resize_google_image, text};
 
 #[derive(Clone, Debug)]
 pub struct Artist {
@@ -26,12 +26,12 @@ pub struct AlbumPage {
     pub songs: Vec<Song>,
 }
 
-/// Search-as-you-type entries. Unlike filtered search, these match partial words.
-#[derive(Clone, Debug, Default)]
-pub struct Suggestions {
-    pub artists: Vec<Artist>,
-    pub albums: Vec<Album>,
-    pub songs: Vec<Song>,
+/// A search-as-you-type entry. Unlike filtered search, suggestions match partial words.
+#[derive(Clone, Debug)]
+pub enum Suggestion {
+    Artist(Artist),
+    Album(Album),
+    Song(Song),
 }
 
 #[derive(Clone, Debug)]
@@ -65,11 +65,7 @@ fn profile_image_url(images: &Value) -> Option<String> {
     let url = image_url(images)?;
     let google_image = reqwest::Url::parse(&url).ok().and_then(|url| url.host_str().map(str::to_owned))
         .is_some_and(|host| host.ends_with(".googleusercontent.com") || host.ends_with(".ggpht.com"));
-    if google_image {
-        if let Some((base, sizing)) = url.rsplit_once('=') {
-            if sizing.starts_with('w') { return Some(format!("{base}=w320-h320-l90-rj")); }
-        }
-    }
+    if google_image && url.contains('=') { return Some(resize_google_image(&url, 320)); }
     Some(url)
 }
 
@@ -84,7 +80,7 @@ fn collect<'a>(value: &'a Value, key: &str, output: &mut Vec<&'a Value>) {
     }
 }
 
-fn parse_search(response: &Value, query: &str) -> Vec<Artist> {
+fn parse_search(response: &Value) -> Vec<Artist> {
     let mut rows = Vec::new();
     collect(&response["contents"], "musicResponsiveListItemRenderer", &mut rows);
     let mut seen = std::collections::HashSet::new();
@@ -97,7 +93,6 @@ fn parse_search(response: &Value, query: &str) -> Vec<Artist> {
         artists.push(Artist { link: ArtistLink { id: id.to_owned(), name },
             image_url: image_url(&row["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]) });
     }
-    artists.sort_by_key(|artist| artist.link.name.trim().to_lowercase() != query.trim().to_lowercase());
     artists.truncate(5);
     artists
 }
@@ -119,31 +114,26 @@ fn parse_album(row: &Value) -> Option<Album> {
         image_url: image_url(&row["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]) })
 }
 
-fn parse_suggestions(response: &Value) -> Suggestions {
+/// Suggestions in YouTube Music's order, keeping artists, albums, and songs.
+fn parse_suggestions(response: &Value) -> Vec<Suggestion> {
     let mut rows = Vec::new();
     collect(&response["contents"], "musicResponsiveListItemRenderer", &mut rows);
-    let mut suggestions = Suggestions::default();
-    for row in rows {
-        match page_type(row) {
-            Some("MUSIC_PAGE_TYPE_ARTIST") => {
-                let id = row.pointer("/navigationEndpoint/browseEndpoint/browseId").and_then(Value::as_str).unwrap_or("");
-                let name = column(row, 0);
-                if id.starts_with("UC") && !name.is_empty() {
-                    suggestions.artists.push(Artist { link: ArtistLink { id: id.to_owned(), name },
-                        image_url: image_url(&row["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]) });
-                }
-            }
-            Some("MUSIC_PAGE_TYPE_ALBUM") => suggestions.albums.extend(parse_album(row)),
-            // Audio tracks only, matching the Songs search filter; skip music videos and uploads.
-            _ if row.pointer("/navigationEndpoint/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType")
-                .and_then(Value::as_str) == Some("MUSIC_VIDEO_TYPE_ATV") => suggestions.songs.extend(parse_song(row)),
-            _ => {}
+    rows.into_iter().filter_map(|row| match page_type(row) {
+        Some("MUSIC_PAGE_TYPE_ARTIST") => {
+            let id = row.pointer("/navigationEndpoint/browseEndpoint/browseId").and_then(Value::as_str)?;
+            let name = column(row, 0);
+            (id.starts_with("UC") && !name.is_empty()).then(|| Suggestion::Artist(Artist { link: ArtistLink { id: id.to_owned(), name },
+                image_url: image_url(&row["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]) }))
         }
-    }
-    suggestions
+        Some("MUSIC_PAGE_TYPE_ALBUM") => parse_album(row).map(Suggestion::Album),
+        // Audio tracks only, matching the Songs search filter; skip music videos and uploads.
+        _ if row.pointer("/navigationEndpoint/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType")
+            .and_then(Value::as_str) == Some("MUSIC_VIDEO_TYPE_ATV") => parse_song(row).map(Suggestion::Song),
+        _ => None,
+    }).collect()
 }
 
-pub fn suggestions(query: &str) -> Result<Suggestions, Box<dyn Error>> {
+pub fn suggestions(query: &str) -> Result<Vec<Suggestion>, Box<dyn Error>> {
     Ok(parse_suggestions(&request("music/get_search_suggestions", json!({"input": query}))?))
 }
 
@@ -203,7 +193,7 @@ pub fn album(id: &str) -> Result<AlbumPage, Box<dyn Error>> {
 
 pub fn search(query: &str) -> Result<Vec<Artist>, Box<dyn Error>> {
     let response = request("search", json!({"query": query, "params": "EgWKAQIgAWoMEA4QChADEAQQCRAF"}))?;
-    Ok(parse_search(&response, query))
+    Ok(parse_search(&response))
 }
 
 fn parse_profile(response: &Value, id: &str) -> Result<Profile, Box<dyn Error>> {
@@ -289,19 +279,18 @@ mod tests {
             {"url": "https://example.com/banner.jpg", "width": 2880, "height": 1200}]);
         assert_eq!(profile_image_url(&square).as_deref(), Some("https://example.com/square.jpg"));
         let banner = json!([{"url": "https://yt3.googleusercontent.com/portrait=w2880-h1200-p-l90-rj", "width": 2880, "height": 1200}]);
-        assert_eq!(profile_image_url(&banner).as_deref(), Some("https://yt3.googleusercontent.com/portrait=w320-h320-l90-rj"));
+        assert_eq!(profile_image_url(&banner).as_deref(), Some("https://yt3.googleusercontent.com/portrait=w320-h320-p-l90-rj"));
     }
 
     #[test]
-    fn exact_artist_match_precedes_other_results() {
+    fn artist_results_keep_youtube_order_without_duplicates() {
         let row = |id: &str, name: &str| json!({"musicResponsiveListItemRenderer": {
             "navigationEndpoint": {"browseEndpoint": {"browseId": id}},
             "flexColumns": [{"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": name}]}}}]
         }});
         let response = json!({"contents": [row("UCother", "Other"), row("UCnujabes", "Nujabes"), row("UCnujabes", "Nujabes"), row("MPREalbum", "Album")]});
-        let artists = parse_search(&response, " nujabes ");
-        assert_eq!(artists.len(), 2);
-        assert_eq!(artists[0].link.name, "Nujabes");
+        let artists = parse_search(&response);
+        assert_eq!(artists.iter().map(|artist| artist.link.name.as_str()).collect::<Vec<_>>(), ["Other", "Nujabes"]);
     }
 
     fn suggestion_row(title: &str, subtitle: Value, navigation: Value) -> Value {
@@ -334,11 +323,10 @@ mod tests {
             suggestion_row("Mix", json!([{"text": "Playlist • YouTube Music"}]), browse("VLmix", "MUSIC_PAGE_TYPE_PLAYLIST")),
         ]}}]});
         let suggestions = parse_suggestions(&response);
-        assert_eq!(suggestions.artists.iter().map(|artist| artist.link.id.as_str()).collect::<Vec<_>>(), ["UCpiero"]);
-        assert_eq!(suggestions.albums.len(), 1);
-        assert_eq!(suggestions.albums[0].subtitle, "Album • Piero Piccioni • 2022");
-        assert_eq!(suggestions.songs.len(), 1, "music videos and playlists are skipped");
-        assert_eq!(suggestions.songs[0].artists[0].name, "Piero Piccioni");
+        assert_eq!(suggestions.len(), 3, "music videos and playlists are skipped");
+        assert!(matches!(&suggestions[0], Suggestion::Artist(artist) if artist.link.id == "UCpiero"));
+        assert!(matches!(&suggestions[1], Suggestion::Album(album) if album.subtitle == "Album • Piero Piccioni • 2022"));
+        assert!(matches!(&suggestions[2], Suggestion::Song(song) if song.artists[0].name == "Piero Piccioni"));
     }
 
     #[test]
@@ -384,7 +372,7 @@ mod tests {
     #[ignore = "requires live YouTube Music access"]
     fn live_suggestions_and_album() {
         let suggestions = suggestions("piero pi").unwrap();
-        assert!(suggestions.artists.iter().any(|artist| artist.link.name == "Piero Piccioni"), "{suggestions:?}");
+        assert!(suggestions.iter().any(|item| matches!(item, Suggestion::Artist(artist) if artist.link.name == "Piero Piccioni")), "{suggestions:?}");
         let albums = search_albums("piero piccioni").unwrap();
         assert!(!albums.is_empty());
         let page = album(&albums[0].id).unwrap();

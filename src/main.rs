@@ -41,6 +41,8 @@ struct Ui {
     artist_error: RefCell<Option<String>>,
     artist_back: gtk::Button,
     album_results: RefCell<Vec<oxidance::artists::Album>>,
+    /// Search-as-you-type entries, shown above the full results in YouTube Music's order.
+    suggestions: RefCell<Vec<oxidance::artists::Suggestion>>,
     album_page: RefCell<Option<oxidance::artists::AlbumPage>>,
     album_loading: Cell<bool>,
     album_error: RefCell<Option<String>>,
@@ -332,7 +334,7 @@ impl Ui {
             view: Cell::new(View::Liked), results: RefCell::new(vec![]),
             artist_results: RefCell::new(vec![]), artist_profile: RefCell::new(None),
             artist_request: Cell::new(0), artist_loading: Cell::new(false), biography_expanded: Cell::new(false), artist_error: RefCell::new(None),
-            artist_back, album_results: RefCell::new(vec![]), album_page: RefCell::new(None), album_loading: Cell::new(false),
+            artist_back, album_results: RefCell::new(vec![]), suggestions: RefCell::new(vec![]), album_page: RefCell::new(None), album_loading: Cell::new(false),
             album_error: RefCell::new(None), history: RefCell::new(vec![]),
             generation: Cell::new(0), search_request: Cell::new(0), art_cache: RefCell::new(HashMap::new()), saved_art: RefCell::new(HashMap::new()),
             debounce: RefCell::new(None), suggest_debounce: RefCell::new(None), full_requested: Cell::new(false), results_stale: Cell::new(false), query: RefCell::new(String::new()),
@@ -859,14 +861,23 @@ impl Ui {
             }
         } else { format!("{} songs", songs.len()) });
         let search = self.view.get() == View::Search;
+        let other_results = search && !(self.suggestions.borrow().is_empty() && self.artist_results.borrow().is_empty()
+            && self.album_results.borrow().is_empty());
         if search && self.page_loading.get() {
             self.status.set_text("Searching YouTube Music…");
-        } else if search && !(self.artist_results.borrow().is_empty() && self.album_results.borrow().is_empty()) {
+        } else if other_results {
             self.status.set_text(&self.search_status());
         }
-        self.list.set_visible(!songs.is_empty() || matches!(self.view.get(), View::Artist | View::Album)
-            || search && !(self.artist_results.borrow().is_empty() && self.album_results.borrow().is_empty()));
+        self.list.set_visible(!songs.is_empty() || matches!(self.view.get(), View::Artist | View::Album) || other_results);
         if search {
+            let suggestions = self.suggestions.borrow().clone();
+            for suggestion in &suggestions {
+                match suggestion {
+                    oxidance::artists::Suggestion::Artist(artist) => self.add_artist_result(artist),
+                    oxidance::artists::Suggestion::Album(album) => self.add_album_result(album),
+                    oxidance::artists::Suggestion::Song(song) => self.append_songs(std::slice::from_ref(song)),
+                }
+            }
             for artist in self.artist_results.borrow().iter() { self.add_artist_result(artist); }
             for album in self.album_results.borrow().iter() { self.add_album_result(album); }
         } else if self.view.get() == View::Artist {
@@ -1401,7 +1412,7 @@ impl Ui {
         let mut queue = match self.view.get() {
             View::Liked => self.library.borrow().liked.clone(),
             View::Playlist(id) => self.library.borrow().playlists.iter().find(|p| p.id == id).map(|p| p.songs.clone()).unwrap_or_default(),
-            View::Search => self.results.borrow().clone(),
+            View::Search => self.search_songs(),
             View::Artist => self.artist_profile.borrow().as_ref().map(|p| p.songs.clone()).unwrap_or_default(),
             View::Album => self.album_page.borrow().as_ref().map(|page| page.songs.clone()).unwrap_or_default(),
         };
@@ -1729,6 +1740,7 @@ impl Ui {
     }
 
     fn clear_results(&self) {
+        self.suggestions.borrow_mut().clear();
         self.results.borrow_mut().clear();
         self.artist_results.borrow_mut().clear();
         self.album_results.borrow_mut().clear();
@@ -1768,41 +1780,69 @@ impl Ui {
             if ui.search_request.get() != request || ui.view.get() != View::Search { return; }
             // Suggestions are optional; the full search reports its own errors.
             let Ok(suggestions) = result else { return; };
-            ui.merge_results(suggestions.artists, suggestions.albums, suggestions.songs, true);
+            ui.set_suggestions(suggestions);
             if !ui.page_loading.get() { ui.status.set_text(&ui.search_status()); }
         });
     }
 
-    /// Adds results without duplicates. Suggestions go first because they match partial words.
-    fn merge_results(self: &Rc<Self>, artists: Vec<oxidance::artists::Artist>, albums: Vec<oxidance::artists::Album>, songs: Vec<Song>, first: bool) {
-        fn merge<T: Clone>(current: &mut Vec<T>, new: Vec<T>, first: bool, same: impl Fn(&T, &T) -> bool) {
-            let new: Vec<T> = new.into_iter().filter(|item| !current.iter().any(|saved| same(saved, item))).collect();
-            if first { current.splice(0..0, new); } else { current.extend(new); }
-        }
+    /// Shows suggestions above the full results, removing full results they duplicate.
+    fn set_suggestions(self: &Rc<Self>, suggestions: Vec<oxidance::artists::Suggestion>) {
+        use oxidance::artists::Suggestion;
         let replacing = self.results_stale.get();
         if replacing { self.clear_results(); }
-        let query = self.query.borrow().to_lowercase();
-        {
-            let mut current = self.artist_results.borrow_mut();
-            merge(&mut current, artists, first, |a, b| a.link.id == b.link.id);
-            current.sort_by_key(|artist| artist.link.name.trim().to_lowercase() != query);
-            current.truncate(5);
+        for suggestion in &suggestions {
+            match suggestion {
+                Suggestion::Artist(artist) => self.artist_results.borrow_mut().retain(|saved| saved.link.id != artist.link.id),
+                Suggestion::Album(album) => self.album_results.borrow_mut().retain(|saved| saved.id != album.id),
+                Suggestion::Song(song) => self.results.borrow_mut().retain(|saved| saved.video_id != song.video_id),
+            }
         }
-        {
-            let mut current = self.album_results.borrow_mut();
-            merge(&mut current, albums, first, |a, b| a.id == b.id);
-            current.truncate(3);
+        *self.suggestions.borrow_mut() = suggestions;
+        self.show_results(replacing);
+    }
+
+    /// Adds full search results below the suggestions, without duplicates.
+    fn merge_results(self: &Rc<Self>, artists: Vec<oxidance::artists::Artist>, albums: Vec<oxidance::artists::Album>, songs: Vec<Song>) {
+        use oxidance::artists::Suggestion;
+        let replacing = self.results_stale.get();
+        if replacing { self.clear_results(); }
+        let suggested = self.suggestions.borrow().clone();
+        for artist in artists {
+            let duplicate = self.artist_results.borrow().iter().any(|saved| saved.link.id == artist.link.id)
+                || suggested.iter().any(|item| matches!(item, Suggestion::Artist(saved) if saved.link.id == artist.link.id));
+            if !duplicate && self.artist_results.borrow().len() < 5 { self.artist_results.borrow_mut().push(artist); }
         }
-        merge(&mut self.results.borrow_mut(), songs, first, |a, b| a.video_id == b.video_id);
+        for album in albums {
+            let duplicate = self.album_results.borrow().iter().any(|saved| saved.id == album.id)
+                || suggested.iter().any(|item| matches!(item, Suggestion::Album(saved) if saved.id == album.id));
+            if !duplicate && self.album_results.borrow().len() < 3 { self.album_results.borrow_mut().push(album); }
+        }
+        let songs: Vec<Song> = songs.into_iter().filter(|song| !self.search_songs().iter().any(|saved| saved.video_id == song.video_id)).collect();
+        self.results.borrow_mut().extend(songs);
+        self.show_results(replacing);
+    }
+
+    fn show_results(self: &Rc<Self>, replacing: bool) {
         if replacing {
             self.render();
             self.scroll.vadjustment().set_value(0.0);
         } else { self.render_preserving_scroll(); }
     }
 
+    /// Every song shown for the current search, in display order.
+    fn search_songs(&self) -> Vec<Song> {
+        use oxidance::artists::Suggestion;
+        self.suggestions.borrow().iter().filter_map(|item| match item { Suggestion::Song(song) => Some(song.clone()), _ => None })
+            .chain(self.results.borrow().iter().cloned()).collect()
+    }
+
     fn search_status(&self) -> String {
         let count = |number: usize, one: &str, many: &str| format!("{number} {}", if number == 1 { one } else { many });
-        let (artists, albums, songs) = (self.artist_results.borrow().len(), self.album_results.borrow().len(), self.results.borrow().len());
+        use oxidance::artists::Suggestion;
+        let suggested = |kind: fn(&Suggestion) -> bool| self.suggestions.borrow().iter().filter(|item| kind(item)).count();
+        let artists = self.artist_results.borrow().len() + suggested(|item| matches!(item, Suggestion::Artist(_)));
+        let albums = self.album_results.borrow().len() + suggested(|item| matches!(item, Suggestion::Album(_)));
+        let songs = self.results.borrow().len() + suggested(|item| matches!(item, Suggestion::Song(_)));
         if artists + albums + songs == 0 { return "No results found. Try another query.".into(); }
         let mut parts = Vec::new();
         if artists > 0 { parts.push(count(artists, "artist", "artists")); }
@@ -1863,8 +1903,9 @@ impl Ui {
                 Ok((page, artists, albums)) => {
                     *ui.cursor.borrow_mut() = page.next;
                     if append {
+                        let shown = ui.search_songs();
                         let songs: Vec<Song> = page.songs.into_iter()
-                            .filter(|song| !ui.results.borrow().iter().any(|saved| saved.video_id == song.video_id)).collect();
+                            .filter(|song| !shown.iter().any(|saved| saved.video_id == song.video_id)).collect();
                         ui.results.borrow_mut().extend(songs.clone());
                         ui.append_songs(&songs);
                     } else {
@@ -1873,7 +1914,7 @@ impl Ui {
                             vec![]
                         });
                         let albums = albums.unwrap_or(Ok(vec![])).unwrap_or_default();
-                        ui.merge_results(artists, albums, page.songs, false);
+                        ui.merge_results(artists, albums, page.songs);
                     }
                     ui.status.set_text(&ui.search_status());
                 }
@@ -2010,15 +2051,16 @@ mod tests {
         ui.navigate(View::Search);
         let started = std::time::Instant::now();
         ui.entry.set_text("piero pi");
-        let has_artist = || ui.artist_results.borrow().iter().any(|artist| artist.link.name == "Piero Piccioni");
+        let has_artist = || ui.suggestions.borrow().iter()
+            .any(|item| matches!(item, oxidance::artists::Suggestion::Artist(artist) if artist.link.name == "Piero Piccioni"));
         while !has_artist() && started.elapsed() < Duration::from_secs(20) { pump(); std::thread::sleep(Duration::from_millis(5)); }
         assert!(has_artist(), "a partial name finds the artist through suggestions");
         assert!(!ui.full_requested.get(), "suggestions arrive before the full search starts ({:?})", started.elapsed());
-        let suggested = ui.results.borrow().len();
+        let suggested = ui.search_songs().len();
         while !(ui.full_requested.get() && !ui.page_loading.get()) && started.elapsed() < Duration::from_secs(45) { pump(); std::thread::sleep(Duration::from_millis(10)); }
-        assert!(ui.results.borrow().len() > suggested, "full results follow the suggestions");
+        assert!(ui.search_songs().len() > suggested, "full results follow the suggestions");
         let mut ids = std::collections::HashSet::new();
-        assert!(ui.results.borrow().iter().all(|song| ids.insert(song.video_id.clone())), "no duplicate songs");
+        assert!(ui.search_songs().iter().all(|song| ids.insert(song.video_id.clone())), "no duplicate songs");
         ui.window.close();
     }
 
@@ -2033,21 +2075,25 @@ mod tests {
         let song = |id: &str| Song { video_id: id.into(), title: format!("Track {id}"), artist: None, album_art_url: None, artists: vec![] };
         let artist = |id: &str, name: &str| oxidance::artists::Artist { link: oxidance::ArtistLink { id: id.into(), name: name.into() }, image_url: None };
         let album = |id: &str| oxidance::artists::Album { id: id.into(), title: format!("Album {id}"), subtitle: "Album • Artist • 2022".into(), image_url: None };
-        // Suggestions appear first; full results are appended without duplicates.
+        use oxidance::artists::Suggestion;
+        // Suggestions stay on top in their own order; full results follow without duplicates.
         ui.navigate(View::Search);
         ui.results.borrow_mut().push(song("old"));
-        ui.begin_query("piero piccioni");
+        ui.begin_query("piero");
         assert_eq!(ui.results.borrow().len(), 1, "previous results stay until new ones arrive");
-        ui.merge_results(vec![artist("UCpiero", "Piero Piccioni")], vec![album("hits")], vec![song("a"), song("b")], true);
-        ui.merge_results(vec![artist("UCother", "Other"), artist("UCpiero", "Piero Piccioni")], vec![album("hits"), album("live")],
-            vec![song("b"), song("c")], false);
+        ui.set_suggestions(vec![Suggestion::Artist(artist("UCpiccioni", "Piero Piccioni")), Suggestion::Album(album("hits")),
+            Suggestion::Song(song("a")), Suggestion::Song(song("b"))]);
+        ui.merge_results(vec![artist("UCpiero", "piero"), artist("UCpiccioni", "Piero Piccioni")], vec![album("hits"), album("live")],
+            vec![song("b"), song("c")]);
         let ids = |songs: &[Song]| songs.iter().map(|song| song.video_id.clone()).collect::<Vec<_>>();
-        assert_eq!(ids(&ui.results.borrow()), ["a", "b", "c"]);
-        assert_eq!(ui.artist_results.borrow().iter().map(|artist| artist.link.id.as_str()).collect::<Vec<_>>(), ["UCpiero", "UCother"]);
-        assert_eq!(ui.album_results.borrow().len(), 2);
+        assert_eq!(ids(&ui.search_songs()), ["a", "b", "c"]);
+        assert_eq!(ui.artist_results.borrow().iter().map(|artist| artist.link.id.as_str()).collect::<Vec<_>>(), ["UCpiero"]);
+        assert_eq!(ui.album_results.borrow().iter().map(|album| album.id.as_str()).collect::<Vec<_>>(), ["live"]);
         assert_eq!(ui.search_status(), "2 artists · 2 albums · 3 songs");
-        let rows = descendants(ui.list.upcast_ref());
-        assert!(rows.iter().any(|widget| widget.widget_name() == "album-hits"), "album results are listed");
+        let names: Vec<String> = descendants(ui.list.upcast_ref()).into_iter().map(|widget| widget.widget_name().to_string())
+            .filter(|name| name.starts_with("artist-") || name.starts_with("album-") || name.starts_with("song-art-")).collect();
+        assert_eq!(names, ["artist-UCpiccioni", "album-hits", "song-art-a", "song-art-b", "artist-UCpiero", "album-live", "song-art-c"],
+            "suggestions come first, even before an exact artist match");
         // Album pages show their artists and play their tracks as a queue.
         ui.push_history(View::Album);
         ui.navigate(View::Album);
@@ -2071,12 +2117,12 @@ mod tests {
         assert!(ui.view.get() == View::Album && ui.album_page.borrow().is_some());
         ui.artist_back.emit_clicked();
         assert!(ui.view.get() == View::Search);
-        assert_eq!(ids(&ui.results.borrow()), ["a", "b", "c"]);
+        assert_eq!(ids(&ui.search_songs()), ["a", "b", "c"]);
         // A new query replaces the old results once its first results arrive.
         ui.begin_query("another");
-        ui.merge_results(vec![], vec![], vec![song("x")], true);
-        assert_eq!(ids(&ui.results.borrow()), ["x"]);
-        assert!(ui.artist_results.borrow().is_empty() && ui.album_results.borrow().is_empty());
+        ui.set_suggestions(vec![Suggestion::Song(song("x"))]);
+        assert_eq!(ids(&ui.search_songs()), ["x"]);
+        assert!(ui.artist_results.borrow().is_empty() && ui.album_results.borrow().is_empty() && ui.results.borrow().is_empty());
         ui.window.close();
     }
 

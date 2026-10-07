@@ -6,11 +6,25 @@ use serde_json::{Value, json};
 pub mod library;
 pub mod artists;
 
+/// Requests a Google-hosted image at `size` pixels, keeping its other options. In
+/// particular, `p` crops to the requested square; without it, wide images stay wide.
+pub(crate) fn resize_google_image(url: &str, size: u32) -> String {
+    let (base, options) = url.split_once('=').unwrap_or((url, ""));
+    let is_size = |option: &str| option.len() > 1 && matches!(option.as_bytes()[0], b'w' | b'h' | b's')
+        && option[1..].bytes().all(|byte| byte.is_ascii_digit());
+    let mut parts = vec![format!("w{size}"), format!("h{size}")];
+    parts.extend(options.split('-').filter(|option| !option.is_empty() && !is_size(option)).map(str::to_owned));
+    for default in ["l90", "rj"] {
+        if !parts.iter().any(|part| part == default) { parts.push(default.to_owned()); }
+    }
+    format!("{base}={}", parts.join("-"))
+}
+
 pub fn search_art_url(url: &str) -> String {
     let Ok(parsed) = reqwest::Url::parse(url) else { return url.to_owned(); };
     match parsed.host_str() {
         Some("yt3.googleusercontent.com" | "lh3.googleusercontent.com" | "yt3.ggpht.com") =>
-            format!("{}=w240-h240-l90-rj", url.split('=').next().unwrap_or(url)),
+            resize_google_image(url, 240),
         Some("i.ytimg.com") if parsed.path().starts_with("/vi/") =>
             format!("{}/mqdefault.jpg", url.rsplit_once('/').unwrap().0),
         Some("i.scdn.co") => url.replace("ab67616d0000b273", "ab67616d00001e02"),
@@ -21,7 +35,7 @@ pub fn search_art_url(url: &str) -> String {
 pub fn high_quality_art_url(url: &str) -> String {
     if let Ok(parsed) = reqwest::Url::parse(url) {
         if parsed.host_str().is_some_and(|host| host == "yt3.googleusercontent.com" || host == "lh3.googleusercontent.com" || host == "yt3.ggpht.com") {
-            return format!("{}=w1200-h1200-l90-rj", url.split('=').next().unwrap_or(url));
+            return resize_google_image(url, 1200);
         }
         if parsed.host_str() == Some("i.ytimg.com") && parsed.path().starts_with("/vi/") {
             if let Some((base, _)) = url.rsplit_once('/') { return format!("{base}/maxresdefault.jpg"); }
@@ -203,6 +217,17 @@ mod tests {
                 {"url": "https://example.com/large.jpg", "width": 120, "height": 120}
             ]}}}
         })
+    }
+
+    #[test]
+    fn resized_images_keep_their_crop_option() {
+        let artist = "https://lh3.googleusercontent.com/photo=w120-h120-p-l90-rj";
+        assert_eq!(search_art_url(artist), "https://lh3.googleusercontent.com/photo=w240-h240-p-l90-rj");
+        assert_eq!(high_quality_art_url(artist), "https://lh3.googleusercontent.com/photo=w1200-h1200-p-l90-rj");
+        let cover = "https://lh3.googleusercontent.com/cover=w120-h120-l90-rj";
+        assert_eq!(search_art_url(cover), "https://lh3.googleusercontent.com/cover=w240-h240-l90-rj", "unchanged without options");
+        assert_eq!(high_quality_art_url("https://yt3.ggpht.com/plain=s88"), "https://yt3.ggpht.com/plain=w1200-h1200-l90-rj");
+        assert_eq!(search_art_url("https://yt3.googleusercontent.com/bare"), "https://yt3.googleusercontent.com/bare=w240-h240-l90-rj");
     }
 
     #[test]
