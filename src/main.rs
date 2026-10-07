@@ -1127,7 +1127,7 @@ impl Ui {
             .width_request(16).height_request(16).build();
         let download_indicator = gtk::Stack::builder().valign(gtk::Align::Center).width_request(16).height_request(16).build();
         download_indicator.add_named(&download_spinner, Some("downloading"));
-        let check = gtk::Image::from_icon_name("emblem-ok-symbolic");
+        let check = gtk::Image::from_icon_name("object-select-symbolic");
         check.set_pixel_size(16);
         download_indicator.add_named(&check, Some("complete"));
         self.download_spinners.borrow_mut().push((song.video_id.clone(), download_indicator.downgrade()));
