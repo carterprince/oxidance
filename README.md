@@ -48,13 +48,11 @@ Build and launch:
 cargo run --release
 ```
 
-To install the binary, desktop entry, and icon for your user:
+To build and install Oxidance for your user, with its desktop entry and icon
+(the binary goes to `~/.local/bin`; set `PREFIX` to change that):
 
 ```sh
-cargo build --release
-install -Dm755 target/release/oxidance ~/.local/bin/oxidance
-install -Dm644 data/io.github.oxidance.Oxidance.desktop -t ~/.local/share/applications
-install -Dm644 data/icons/scalable/apps/io.github.oxidance.Oxidance.svg -t ~/.local/share/icons/hicolor/scalable/apps
+./install.sh
 ```
 
 ## Sync
