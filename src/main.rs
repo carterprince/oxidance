@@ -146,12 +146,21 @@ impl Ui {
         header.pack_start(&search_page);
         let artist_back = gtk::Button::builder().icon_name("go-previous-symbolic").tooltip_text("Back").visible(false).build();
         header.pack_start(&artist_back);
+        // The search entry makes this bar taller than the sidebar's; keep buttons at their natural height.
+        for button in [toggle.upcast_ref::<gtk::Widget>(), search_page.upcast_ref(), artist_back.upcast_ref(), options.upcast_ref(), sync_button.upcast_ref()] {
+            button.set_valign(gtk::Align::Center);
+        }
         split.bind_property("show-sidebar", &toggle, "active").bidirectional().sync_create().build();
         let sidebar_header = adw::HeaderBar::new();
         sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("Playlists", "")));
         let sidebar_toggle = gtk::ToggleButton::builder().icon_name("sidebar-show-symbolic")
             .tooltip_text("Show or hide library sidebar").active(true).build();
+        sidebar_toggle.set_valign(gtk::Align::Center);
         sidebar_header.pack_start(&sidebar_toggle);
+        // Match the header heights so the toggle doesn't shift when the sidebar opens.
+        let header_heights = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
+        header_heights.add_widget(&header);
+        header_heights.add_widget(&sidebar_header);
         split.bind_property("show-sidebar", &sidebar_toggle, "active").bidirectional().sync_create().build();
         let update_toggle = {
             let toggle = toggle.clone();
@@ -351,6 +360,7 @@ impl Ui {
         });
         let create = ui.playlist_menu(None);
         create.set_tooltip_text(Some("Create playlist"));
+        create.set_valign(gtk::Align::Center);
         sidebar_header.pack_end(&create);
         let preferences = gtk::gio::SimpleAction::new("preferences", None);
         preferences.connect_activate({ let weak = Rc::downgrade(&ui); move |_, _| {
