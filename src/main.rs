@@ -1861,7 +1861,11 @@ impl Ui {
         let artists = count(|item| matches!(item, SearchItem::Artist(_)));
         let albums = count(|item| matches!(item, SearchItem::Album(_)));
         let songs = count(|item| matches!(item, SearchItem::Song(_)));
-        if artists + albums + songs == 0 { return "No results found. Try another query.".into(); }
+        if artists + albums + songs == 0 {
+            // Empty suggestions arrive before the full search starts; only its results are final.
+            if !self.full_requested.get() || self.page_loading.get() { return "Searching YouTube Music…".into(); }
+            return "No results found. Try another query.".into();
+        }
         let mut parts = Vec::new();
         if artists > 0 { parts.push(label(artists, "artist", "artists")); }
         if albums > 0 { parts.push(label(albums, "album", "albums")); }
