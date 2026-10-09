@@ -20,6 +20,10 @@ Oxidance is an unofficial client and is not affiliated with YouTube or Google.
 - **Library:** like songs and organize them into playlists. Your library is
   stored locally in `~/.local/share/oxidance/library.json`, not in a YouTube
   account.
+- **Songs from other sites:** add a song from a Bandcamp, SoundCloud, or other
+  link that yt-dlp supports with **Add From Link** on Liked songs or a
+  playlist. The title, artist, and cover are detected; fill in anything that is
+  missing or choose your own cover, and play a preview before adding it.
 - **Offline listening:** liked songs and playlist songs are downloaded to
   `~/Music` in their original audio format, with album artwork. Saved songs play
   from disk; everything else streams.

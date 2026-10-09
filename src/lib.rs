@@ -74,6 +74,27 @@ pub struct Song {
     pub album_art_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artists: Vec<ArtistLink>,
+    /// The page of a song added from a link outside YouTube, such as Bandcamp.
+    /// YouTube songs leave it empty and are found by `video_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+}
+
+impl Song {
+    /// The page that yt-dlp streams and downloads this song from.
+    pub fn page_url(&self) -> String {
+        self.source_url.clone().unwrap_or_else(|| format!("https://music.youtube.com/watch?v={}", self.video_id))
+    }
+}
+
+/// Downloads an image, or reads it when `url` is a local `file://` URL (a cover
+/// the user chose for a song added from a link).
+pub fn fetch_image(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
+    if let Some(path) = reqwest::Url::parse(url).ok().filter(|url| url.scheme() == "file").and_then(|url| url.to_file_path().ok()) {
+        return std::fs::read(path).map_err(|error| error.to_string());
+    }
+    client.get(url).send().and_then(reqwest::blocking::Response::error_for_status)
+        .and_then(reqwest::blocking::Response::bytes).map(|bytes| bytes.to_vec()).map_err(|error| error.to_string())
 }
 
 pub(crate) fn text(value: &Value) -> String {
@@ -111,7 +132,7 @@ pub(crate) fn parse_song(renderer: &Value) -> Option<Song> {
         .and_then(|images| images.iter().filter(|image| image["url"].is_string())
             .max_by_key(|image| image["width"].as_u64().unwrap_or(0) * image["height"].as_u64().unwrap_or(0)))
         .and_then(|image| image["url"].as_str()).map(str::to_owned);
-    Some(Song { video_id: video_id.to_owned(), title, artist: (!artists.is_empty()).then(|| artists.join(", ")), album_art_url, artists: links })
+    Some(Song { video_id: video_id.to_owned(), title, artist: (!artists.is_empty()).then(|| artists.join(", ")), album_art_url, artists: links, source_url: None })
 }
 
 const PAGE_SIZE: usize = 25;

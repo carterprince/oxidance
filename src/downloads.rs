@@ -58,15 +58,14 @@ fn save_art(audio: &Path, song: &Song, cancelled: &AtomicBool) -> Result<(), Str
     if existing && (preferred == *url || std::fs::read_to_string(&source).is_ok_and(|saved| saved == preferred)) { return Ok(()); }
     if cancelled.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
     let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(20)).build().map_err(|error| error.to_string())?;
-    let fetch = |url: &str| client.get(url).send().and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(reqwest::blocking::Response::bytes);
+    let fetch = |url: &str| oxidance::fetch_image(&client, url);
     let bytes = match fetch(&preferred).or_else(|_| fetch(url)) {
         Ok(bytes) => bytes,
         Err(_) if existing => return Ok(()), // Keep the usable offline cover when disconnected.
         Err(error) => return Err(error.to_string()),
     };
     // Validate the image before making it available to offline playback.
-    gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(bytes.to_vec())).map_err(|error| error.to_string())?;
+    gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(bytes.clone())).map_err(|error| error.to_string())?;
     if cancelled.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
     let temporary = path.with_extension("cover.part");
     std::fs::write(&temporary, &bytes).map_err(|error| error.to_string())?;
@@ -184,12 +183,13 @@ fn download_audio(directory: &Path, song: &Song, cancelled: Arc<AtomicBool>) -> 
     let args: Vec<String> = [
         "--ignore-config", "--no-playlist", "--no-warnings", "--js-runtimes", "node",
         "--socket-timeout", "15", "--retries", "2", "--extractor-retries", "1",
-        "--no-progress", "--no-overwrites", "-f", "bestaudio",
+        "--no-progress", "--no-overwrites", "-f", "bestaudio/best",
         "--paths",
     ].into_iter().map(str::to_owned).chain([
         directory.to_string_lossy().into_owned(), "-o".into(),
-        "%(artist,uploader)s - %(title)s [%(id)s].%(ext)s".into(),
-        "--".into(), format!("https://music.youtube.com/watch?v={}", song.video_id),
+        // Name the file by the library's ID, which differs from the site's for songs added from links.
+        format!("%(artist,uploader)s - %(title)s [{}].%(ext)s", song.video_id),
+        "--".into(), song.page_url(),
     ]).collect();
     // YouTube intermittently rejects a download URL (for example, HTTP 403).
     // Each attempt runs yt-dlp again, which extracts fresh URLs.
@@ -256,7 +256,7 @@ mod tests {
         assert!(local_art(&directory, "example").is_none());
         std::fs::write(audio.with_extension("cover"), &cover).unwrap();
         let song = Song { video_id: "example".into(), title: "Song".into(), artist: None,
-            album_art_url: Some("http://127.0.0.1:9/unavailable".into()), artists: vec![] };
+            album_art_url: Some("http://127.0.0.1:9/unavailable".into()), artists: vec![], source_url: None };
         assert_eq!(download(&directory, &song, None, Arc::new(AtomicBool::new(false))).unwrap(), audio);
         assert_eq!(std::fs::read(local_art(&directory, "example").unwrap()).unwrap(), cover);
         std::fs::remove_dir_all(directory).unwrap();

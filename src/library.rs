@@ -58,6 +58,13 @@ impl Library {
         }
     }
 
+    /// Adds a song to the liked songs. Returns false if it is already there.
+    pub fn like(&mut self, song: &Song) -> bool {
+        if self.is_liked(song) { return false; }
+        self.liked.insert(0, song.clone());
+        true
+    }
+
     pub fn create_playlist(&mut self, name: &str) -> Result<u64, String> {
         let name = name.trim();
         if name.is_empty() { return Err("Enter a playlist name.".into()); }
@@ -193,7 +200,7 @@ mod tests {
     use super::*;
 
     fn song(id: &str) -> Song {
-        Song { video_id: id.into(), title: "Same title".into(), artist: None, album_art_url: None, artists: vec![] }
+        Song { video_id: id.into(), title: "Same title".into(), artist: None, album_art_url: None, artists: vec![], source_url: None }
     }
 
     #[test]
@@ -204,6 +211,10 @@ mod tests {
         library.toggle_like(&song("one"));
         assert!(!library.is_liked(&song("one")));
         assert!(library.is_liked(&song("two")));
+        assert!(!library.like(&song("two")), "liking again keeps the song");
+        assert!(library.like(&song("one")));
+        assert_eq!(ids(&library.liked), ["one", "two"]);
+        library.toggle_like(&song("one"));
         let id = library.create_playlist(" Mix ").unwrap();
         assert!(library.add_song(id, &song("one")).unwrap());
         assert!(!library.add_song(id, &song("one")).unwrap());

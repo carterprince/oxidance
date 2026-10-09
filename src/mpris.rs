@@ -60,7 +60,7 @@ fn properties(ui: &Ui) -> BTreeMap<String, glib::Variant> {
         let artists: Vec<String> = if song.artists.is_empty() { song.artist.iter().cloned().collect() }
             else { song.artists.iter().map(|artist| artist.name.clone()).collect() };
         metadata.insert("xesam:artist".into(), artists.to_variant());
-        metadata.insert("xesam:url".into(), format!("https://music.youtube.com/watch?v={}", song.video_id).to_variant());
+        metadata.insert("xesam:url".into(), song.page_url().to_variant());
         let art = downloads::local_art(&ui.music_directory, &song.video_id)
             .map(|path| gio::File::for_path(path).uri().to_string())
             .or_else(|| song.album_art_url.as_deref().map(oxidance::high_quality_art_url));
