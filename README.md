@@ -90,3 +90,7 @@ cargo test --bin oxidance sync_merges -- --ignored
 # UI tests need a display; run each one separately.
 cargo test --bin oxidance -- --ignored --list
 ```
+
+## License
+
+Licensed under the GNU General Public License, version 3 or later. See [LICENSE](LICENSE).
