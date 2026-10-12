@@ -11,6 +11,12 @@ own WebDAV server.
 
 Oxidance is an unofficial client and is not affiliated with YouTube or Google.
 
+<p align="center">
+  <img src="data/screenshot.png" width="920" alt="Oxidance showing liked songs, playlists, and the song playing">
+  <br>
+  <sub>Music in the screenshot by Kevin MacLeod (incompetech.com), licensed under CC BY 4.0.</sub>
+</p>
+
 ## Features
 
 - **Search:** find songs, artists, and albums. Suggestions appear as you type,
