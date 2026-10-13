@@ -7,8 +7,28 @@ use super::*;
 use crate::dav::{Dav, SONGS, normalize_url};
 
 const LIBRARY: &str = "library.json";
+const DISCORD: &str = "discord.json";
 
-enum Event { Library(Library), Progress(String) }
+enum Event { Library(Library), Progress(String), DiscordToken(DiscordToken) }
+
+/// The Discord token and when it was last set. An empty token records that it was removed.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DiscordToken { pub token: String, pub changed: i64 }
+
+/// Keeps whichever device changed the Discord token most recently. Returns the server's token
+/// when it is newer than this device's.
+fn sync_discord_token(dav: &Dav, local: &DiscordToken) -> Result<Option<DiscordToken>, String> {
+    let remote = dav.get(DISCORD)?.and_then(|bytes| serde_json::from_slice::<DiscordToken>(&bytes).ok());
+    match remote {
+        Some(remote) if remote.changed > local.changed => Ok((remote.token != local.token).then_some(remote)),
+        Some(remote) if remote.changed == local.changed || remote.token == local.token => Ok(None),
+        None if local.changed == 0 => Ok(None),
+        _ => {
+            dav.put(DISCORD, serde_json::to_vec_pretty(local).map_err(|error| error.to_string())?, None)?;
+            Ok(None)
+        }
+    }
+}
 
 /// The library as last synced with a particular server, used as the merge base.
 #[derive(Deserialize, Serialize)]
@@ -238,11 +258,16 @@ impl Controller {
         let snapshot = ui.library.borrow().clone();
         let local = snapshot.clone();
         let base_path = ui.path.with_file_name("sync-base.json");
+        // Skipped until the token is loaded, so a device that hasn't read its keyring yet doesn't look like it removed it.
+        let discord = ui.discord_token.borrow().clone().map(|token| DiscordToken { token, changed: ui.settings.int64("discord-token-changed") });
         let music = ui.music_directory.clone();
         let (events, updates) = async_channel::unbounded();
         let (finished, result) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = finished.send_blocking(cycle(&dav, &local, &base_path, &music, &events));
+            let result = discord.map_or(Ok(None), |discord| sync_discord_token(&dav, &discord)).map(|newer| {
+                if let Some(newer) = newer { let _ = events.send_blocking(Event::DiscordToken(newer)); }
+            }).and_then(|_| cycle(&dav, &local, &base_path, &music, &events));
+            let _ = finished.send_blocking(result);
         });
         let generation = self.generation.get();
         let weak = Rc::downgrade(self);
@@ -253,6 +278,7 @@ impl Controller {
                 match event {
                     Event::Library(merged) => controller.apply(&snapshot, merged),
                     Event::Progress(detail) => controller.status(None, &detail),
+                    Event::DiscordToken(newer) => if let Some(ui) = controller.ui.upgrade() { ui.adopt_discord_token(newer); },
                 }
             }
             let result = result.recv().await.unwrap_or_else(|_| Err("Sync stopped unexpectedly.".into()));
@@ -453,6 +479,19 @@ mod tests {
         // An emptied local library is treated as a fresh device, not a mass deletion.
         cycle(&dav, &Library::default(), &second.join("sync-base.json"), &second.join("Music"), &events).unwrap();
         assert!(load_base(&second.join("sync-base.json"), url.as_str()).unwrap().unwrap().is_liked(&song("one")));
+        // The most recently changed Discord token wins, including a removal.
+        let older = DiscordToken { token: "old".into(), changed: 1 };
+        let newer = DiscordToken { token: "new".into(), changed: 2 };
+        assert_eq!(sync_discord_token(&dav, &DiscordToken { token: String::new(), changed: 0 }).unwrap(), None, "nothing to share yet");
+        assert!(!served.join(DISCORD).exists());
+        assert_eq!(sync_discord_token(&dav, &older).unwrap(), None);
+        assert_eq!(sync_discord_token(&dav, &newer).unwrap(), None);
+        assert_eq!(sync_discord_token(&dav, &older).unwrap(), Some(newer.clone()));
+        assert_eq!(sync_discord_token(&dav, &DiscordToken { token: String::new(), changed: 0 }).unwrap(), Some(newer.clone()), "a new device receives it");
+        assert_eq!(sync_discord_token(&dav, &newer).unwrap(), None);
+        let removed = DiscordToken { token: String::new(), changed: 3 };
+        assert_eq!(sync_discord_token(&dav, &removed).unwrap(), None);
+        assert_eq!(sync_discord_token(&dav, &newer).unwrap(), Some(removed));
         // A brand-new device has no data directory yet.
         let fresh = root.join("fresh/oxidance/sync-base.json");
         cycle(&dav, &Library::default(), &fresh, &root.join("fresh/Music"), &events).unwrap();

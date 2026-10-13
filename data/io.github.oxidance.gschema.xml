@@ -32,5 +32,10 @@
       <summary>Sync server username</summary>
       <description>Username for the sync server. The password is stored in the system keyring.</description>
     </key>
+    <key name="discord-token-changed" type="x">
+      <default>0</default>
+      <summary>When the Discord token last changed</summary>
+      <description>Milliseconds since the Unix epoch, or 0 if never set. Sync keeps the most recently changed token; the token itself is stored in the system keyring.</description>
+    </key>
   </schema>
 </schemalist>

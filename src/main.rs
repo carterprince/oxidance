@@ -11,6 +11,7 @@ mod mpris;
 mod dav;
 mod sync;
 mod add_link;
+mod discord;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum View { Search, Liked, Playlist(u64), Artist, Album }
@@ -74,6 +75,9 @@ struct Ui {
     queue_position: Cell<usize>,
     volume: Cell<f64>,
     mpris: RefCell<Option<mpris::Service>>,
+    discord: RefCell<Option<discord::Presence>>,
+    /// None until loaded from the keyring.
+    discord_token: RefCell<Option<String>>,
     playback_title: gtk::Label,
     seek: gtk::Scale,
     elapsed: gtk::Label,
@@ -358,6 +362,7 @@ impl Ui {
             playback_bar, playback_art, sidebar_art, playback_button, playback_title,
             previous_button, next_button, shuffle_button, playback_queue: RefCell::new(vec![]),
             playback_order: RefCell::new(vec![]), queue_position: Cell::new(0), volume: Cell::new(1.0), mpris: RefCell::new(None),
+            discord: RefCell::new(None), discord_token: RefCell::new(None),
             seek, elapsed, duration, seek_pending: Cell::new(false), seek_dragging: Cell::new(false),
             playback_rate: Cell::new(saved_speed), applied_rate: Cell::new(1.0), settings,
             player: RefCell::new(None), bus_watch: RefCell::new(None), current_song: RefCell::new(None),
@@ -458,6 +463,7 @@ impl Ui {
             let Some(ui) = weak.upgrade() else { return glib::ControlFlow::Break; };
             ui.update_timeline();
             if let Some(service) = ui.mpris.borrow().as_ref() { service.update(&ui); }
+            if let Some(presence) = ui.discord.borrow().as_ref() { presence.update(ui.discord_activity()); }
             glib::ControlFlow::Continue
         }});
         search_page.connect_clicked({ let weak = Rc::downgrade(&ui); move |_| {
@@ -513,7 +519,74 @@ impl Ui {
         group.add(&row);
         page.add(&group);
         dialog.add(&page);
+        dialog.add(&self.discord_preferences());
         dialog.present(Some(&self.window));
+    }
+
+    fn discord_preferences(self: &Rc<Self>) -> adw::PreferencesPage {
+        let page = adw::PreferencesPage::builder().title("Discord").icon_name("user-available-symbolic").build();
+        let group = adw::PreferencesGroup::builder().title("Rich Presence")
+            .description("Show the song you’re listening to on your Discord profile, even when Discord isn’t open. \
+                Discord may suspend accounts whose token is used outside its app. The token is stored in the system keyring.").build();
+        // Filled in before the apply button is enabled, so the saved token doesn't look like an unsaved edit.
+        let row = adw::PasswordEntryRow::builder().title("Account token").text(self.discord_token.borrow().as_deref().unwrap_or_default()).build();
+        row.set_show_apply_button(true);
+        row.connect_apply({ let weak = Rc::downgrade(self); move |row| {
+            let token = row.text().trim().to_owned();
+            let weak = weak.clone();
+            glib::spawn_future_local(async move {
+                let saved = token.clone();
+                let result = gtk::gio::spawn_blocking(move || discord::store_token(&saved)).await
+                    .unwrap_or_else(|_| Err("Could not save the Discord token.".into()));
+                let Some(ui) = weak.upgrade() else { return; };
+                match result {
+                    Ok(()) => {
+                        if let Some(presence) = ui.discord.borrow().as_ref() { presence.set_token(Some(token.clone())); }
+                        ui.toast(if token.is_empty() { "Discord token removed" } else { "Discord token saved" });
+                        *ui.discord_token.borrow_mut() = Some(token);
+                        let _ = ui.settings.set_int64("discord-token-changed", discord::Activity::now_ms());
+                        if let Some(sync) = ui.sync.borrow().as_ref() { sync.request_soon(); }
+                    }
+                    Err(error) => ui.toast(&error),
+                }
+            });
+        }});
+        group.add(&row);
+        page.add(&group);
+        page
+    }
+
+    /// Uses a Discord token that another device set more recently, received through sync.
+    fn adopt_discord_token(self: &Rc<Self>, newer: sync::DiscordToken) {
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let token = newer.token.clone();
+            let result = gtk::gio::spawn_blocking(move || discord::store_token(&token)).await
+                .unwrap_or_else(|_| Err("Could not save the synced Discord token.".into()));
+            let Some(ui) = weak.upgrade() else { return; };
+            if let Err(error) = result { ui.toast(&error); return; }
+            if let Some(presence) = ui.discord.borrow().as_ref() { presence.set_token(Some(newer.token.clone())); }
+            *ui.discord_token.borrow_mut() = Some(newer.token);
+            let _ = ui.settings.set_int64("discord-token-changed", newer.changed);
+        });
+    }
+
+    /// What Discord should show: the playing song and where it is in its timeline, or nothing while paused.
+    fn discord_activity(&self) -> Option<discord::Activity> {
+        if !self.desired_playing.get() { return None; }
+        let song = self.current_song.borrow().clone()?;
+        if song.title.trim().is_empty() { return None; }
+        let player = self.player.borrow().clone()?;
+        let position = player.query_position::<gst::ClockTime>()?;
+        let rate = self.applied_rate.get().max(0.01);
+        let start_ms = discord::Activity::now_ms() - (position.mseconds() as f64 / rate) as i64;
+        let end_ms = player.query_duration::<gst::ClockTime>().map(|duration| start_ms + (duration.mseconds() as f64 / rate) as i64);
+        let artist = if song.artists.is_empty() { song.artist.clone() }
+            else { Some(song.artists.iter().map(|artist| artist.name.as_str()).collect::<Vec<_>>().join(", ")) };
+        // Discord fetches art itself, so only public images work, not downloaded copies.
+        let art_url = song.album_art_url.as_deref().filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+            .map(oxidance::high_quality_art_url);
+        Some(discord::Activity { title: song.title, artist: artist.filter(|artist| !artist.trim().is_empty()), start_ms, end_ms, art_url })
     }
 
     fn update_sidebar_art(&self) {
@@ -1968,10 +2041,29 @@ fn main() -> glib::ExitCode {
             Ok(service) => *ui.mpris.borrow_mut() = Some(service),
             Err(error) => eprintln!("MPRIS unavailable: {error}"),
         }
+        let (errors, problems) = async_channel::unbounded();
+        *ui.discord.borrow_mut() = Some(discord::Presence::new(None, errors));
+        glib::spawn_future_local({ let weak = Rc::downgrade(&ui); async move {
+            let token = gtk::gio::spawn_blocking(discord::load_token).await.ok().flatten();
+            let Some(ui) = weak.upgrade() else { return; };
+            *ui.discord_token.borrow_mut() = Some(token.clone().unwrap_or_default());
+            // A token saved before sync existed counts as the oldest change, so any newer one replaces it.
+            if token.is_some() && ui.settings.int64("discord-token-changed") == 0 {
+                let _ = ui.settings.set_int64("discord-token-changed", 1);
+            }
+            if let Some(presence) = ui.discord.borrow().as_ref() { presence.set_token(token); }
+        }});
+        glib::spawn_future_local({ let weak = Rc::downgrade(&ui); async move {
+            while let Ok(problem) = problems.recv().await {
+                let Some(ui) = weak.upgrade() else { return; };
+                ui.toast(&problem);
+            }
+        }});
         let window = ui.window.clone();
         let lifetime = RefCell::new(Some(ui));
         window.connect_close_request(move |_| {
-            lifetime.borrow_mut().take();
+            // Sign out of Discord now; the process may exit before the last reference to the UI is dropped.
+            if let Some(ui) = lifetime.borrow_mut().take() { ui.discord.borrow_mut().take(); }
             glib::Propagation::Proceed
         });
     });
