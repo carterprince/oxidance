@@ -1,5 +1,5 @@
-use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
-use oxidance::Song;
+use std::{collections::{HashMap, HashSet, VecDeque}, path::{Path, PathBuf}, sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
+use oxidance::{Section, Song};
 use crate::dav::{Dav, SONGS};
 
 /// The connected sync server, shared with download and sync threads.
@@ -49,13 +49,21 @@ pub fn local_file(directory: &Path, id: &str) -> Option<PathBuf> {
 
 pub fn local_art(directory: &Path, id: &str) -> Option<PathBuf> { Index::scan(directory).art(id) }
 
+/// What `.cover.source` records for a cover. Video thumbnails are marked as
+/// trimmed to a square, so covers saved with their black bars are fetched again.
+fn art_source(url: &str) -> String {
+    let preferred = oxidance::high_quality_art_url(url);
+    if oxidance::is_video_thumbnail(url) { format!("{preferred}#uncropped") } else { preferred }
+}
+
 fn save_art(audio: &Path, song: &Song, cancelled: &AtomicBool) -> Result<(), String> {
     let Some(url) = &song.album_art_url else { return Ok(()); };
     let path = audio.with_extension("cover");
     let preferred = oxidance::high_quality_art_url(url);
+    let tag = art_source(url);
     let source = audio.with_extension("cover.source");
     let existing = path.metadata().is_ok_and(|metadata| metadata.len() > 0);
-    if existing && (preferred == *url || std::fs::read_to_string(&source).is_ok_and(|saved| saved == preferred)) { return Ok(()); }
+    if existing && (tag == *url || std::fs::read_to_string(&source).is_ok_and(|saved| saved == tag)) { return Ok(()); }
     if cancelled.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
     let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(20)).build().map_err(|error| error.to_string())?;
     let fetch = |url: &str| oxidance::fetch_image(&client, url);
@@ -70,14 +78,14 @@ fn save_art(audio: &Path, song: &Song, cancelled: &AtomicBool) -> Result<(), Str
     let temporary = path.with_extension("cover.part");
     std::fs::write(&temporary, &bytes).map_err(|error| error.to_string())?;
     std::fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
-    std::fs::write(source, preferred).map_err(|error| error.to_string())
+    std::fs::write(source, tag).map_err(|error| error.to_string())
 }
 
 pub fn needs_art_upgrade(index: &Index, song: &Song) -> bool {
     let Some(url) = &song.album_art_url else { return false; };
-    let preferred = oxidance::high_quality_art_url(url);
+    let tag = art_source(url);
     let Some(audio) = index.file(&song.video_id) else { return false; };
-    preferred != *url && !std::fs::read_to_string(audio.with_extension("cover.source")).is_ok_and(|saved| saved == preferred)
+    tag != *url && !std::fs::read_to_string(audio.with_extension("cover.source")).is_ok_and(|saved| saved == tag)
 }
 
 pub fn download(directory: &Path, song: &Song, remote: Option<&Dav>, cancelled: Arc<AtomicBool>) -> Result<PathBuf, String> {
@@ -151,7 +159,7 @@ pub fn upload_to_server(dav: &Dav, audio: &Path, song: &Song, listing: &HashMap<
     };
     // Replace remote artwork only with the preferred high-quality version, so
     // devices with older artwork do not keep overwriting each other.
-    let preferred = song.album_art_url.as_deref().is_some_and(|url| oxidance::high_quality_art_url(url) == local_source);
+    let preferred = song.album_art_url.as_deref().is_some_and(|url| art_source(url) == local_source);
     let remote_source = listing.get(&format!("{id}.cover.source"));
     if cover.is_file() && (!listing.contains_key(&format!("{id}.cover"))
         || preferred && remote_source != Some(&(local_source.len() as u64))) {
@@ -177,59 +185,114 @@ fn with_retries<T>(attempts: u32, delay: Duration, cancelled: &AtomicBool, mut a
     }
 }
 
-fn download_audio(directory: &Path, song: &Song, cancelled: Arc<AtomicBool>) -> Result<PathBuf, String> {
-    if let Some(path) = local_file(directory, &song.video_id) { return Ok(path); }
-    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+/// Saves a page's audio into `directory`, named by yt-dlp's output `template`.
+fn fetch_audio(directory: &Path, template: String, page: String, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
     let args: Vec<String> = [
         "--ignore-config", "--no-playlist", "--no-warnings", "--js-runtimes", "node",
         "--socket-timeout", "15", "--retries", "2", "--extractor-retries", "1",
         "--no-progress", "--no-overwrites", "-f", "bestaudio/best",
         "--paths",
-    ].into_iter().map(str::to_owned).chain([
-        directory.to_string_lossy().into_owned(), "-o".into(),
-        // Name the file by the library's ID, which differs from the site's for songs added from links.
-        format!("%(artist,uploader)s - %(title)s [{}].%(ext)s", song.video_id),
-        "--".into(), song.page_url(),
-    ]).collect();
+    ].into_iter().map(str::to_owned).chain([directory.to_string_lossy().into_owned(), "-o".into(), template, "--".into(), page]).collect();
     // YouTube intermittently rejects a download URL (for example, HTTP 403).
     // Each attempt runs yt-dlp again, which extracts fresh URLs.
-    with_retries(3, Duration::from_secs(2), &cancelled, || {
+    with_retries(3, Duration::from_secs(2), cancelled, || {
         super::playback::run(&args, cancelled.clone(), Duration::from_secs(20 * 60))
-    })?;
+    }).map(drop)
+}
+
+fn download_audio(directory: &Path, song: &Song, cancelled: Arc<AtomicBool>) -> Result<PathBuf, String> {
+    if let Some(path) = local_file(directory, &song.video_id) { return Ok(path); }
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    if let Some(section) = song.section { return cut_section(directory, song, section, &cancelled); }
+    // Name the file by the library's ID, which differs from the site's for songs added from links.
+    fetch_audio(directory, format!("%(artist,uploader)s - %(title)s [{}].%(ext)s", song.video_id), song.page_url(), &cancelled)?;
     local_file(directory, &song.video_id).ok_or_else(|| "Download finished but the audio file could not be found".into())
 }
 
+/// Cuts a song out of its video's audio, which is downloaded once for all of the video's songs.
+fn cut_section(directory: &Path, song: &Song, section: Section, cancelled: &Arc<AtomicBool>) -> Result<PathBuf, String> {
+    let source = video_audio(&song.page_url(), cancelled)?;
+    let extension = source.extension().and_then(|extension| extension.to_str()).ok_or("Unknown audio format")?;
+    let path = directory.join(local_name(song, extension));
+    // Not a finished song file until it is renamed, so an interrupted cut is redone.
+    let temporary = path.with_extension(format!("cut.{extension}"));
+    // Seeking after opening the input is exact; seeking before it starts at the previous seek point, seconds early.
+    let output = std::process::Command::new("ffmpeg").args(["-v", "error", "-nostdin", "-y", "-i"]).arg(&source)
+        .args(["-ss", &section.start.to_string(), "-to", &section.end.to_string(), "-map", "0:a", "-c", "copy"]).arg(&temporary)
+        .output().map_err(|error| format!("Could not start ffmpeg: {error}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temporary);
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Could not cut the song from its video: {}", message.lines().next().unwrap_or("ffmpeg failed")));
+    }
+    std::fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+/// The audio of a whole video, kept for a day so each of its songs is cut from one download.
+fn video_audio(page: &str, cancelled: &Arc<AtomicBool>) -> Result<PathBuf, String> {
+    let directory = gtk::glib::user_cache_dir().join("oxidance").join("videos");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let entries = || std::fs::read_dir(&directory).into_iter().flatten().filter_map(Result::ok).map(|entry| entry.path());
+    for path in entries() {
+        let age = path.metadata().and_then(|metadata| metadata.modified()).ok().and_then(|modified| modified.elapsed().ok());
+        if age.is_some_and(|age| age > Duration::from_secs(24 * 60 * 60)) { let _ = std::fs::remove_file(path); }
+    }
+    let key: String = page.chars().map(|character| if character.is_ascii_alphanumeric() || character == '-' { character } else { '_' }).collect();
+    let find = || entries().find(|path| path.file_stem().is_some_and(|stem| *stem == *key)
+        && path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| EXTENSIONS.contains(&extension)));
+    if let Some(path) = find() { return Ok(path); }
+    fetch_audio(&directory, format!("{key}.%(ext)s"), page.to_owned(), cancelled)?;
+    find().ok_or_else(|| "Download finished but the video's audio could not be found".into())
+}
+
 pub struct Queue {
-    sender: std::sync::mpsc::Sender<Song>,
+    waiting: Arc<(Mutex<VecDeque<Song>>, Condvar)>,
     pending: Arc<Mutex<HashSet<String>>>,
     cancelled: Arc<AtomicBool>,
 }
 
 impl Queue {
     pub fn new(directory: PathBuf, remote: Remote) -> (Self, async_channel::Receiver<(Song, Result<PathBuf, String>)>) {
-        let (sender, receiver) = std::sync::mpsc::channel::<Song>();
+        let waiting = Arc::new((Mutex::new(VecDeque::<Song>::new()), Condvar::new()));
         let (events, updates) = async_channel::unbounded();
         let pending = Arc::new(Mutex::new(HashSet::new()));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_waiting = waiting.clone();
         let worker_pending = pending.clone();
         let worker_cancelled = cancelled.clone();
-        std::thread::spawn(move || {
-            while let Ok(song) = receiver.recv() {
+        std::thread::spawn(move || loop {
+            let song = {
+                let (songs, ready) = &*worker_waiting;
+                let mut songs = ready.wait_while(songs.lock().unwrap(), |songs| songs.is_empty() && !worker_cancelled.load(Ordering::Relaxed)).unwrap();
                 if worker_cancelled.load(Ordering::Relaxed) { break; }
-                let dav = remote.lock().unwrap().clone();
-                let result = download(&directory, &song, dav.as_deref(), worker_cancelled.clone());
-                worker_pending.lock().unwrap().remove(&song.video_id);
-                if events.send_blocking((song, result)).is_err() { break; }
-            }
+                songs.pop_front().unwrap()
+            };
+            let dav = remote.lock().unwrap().clone();
+            let result = download(&directory, &song, dav.as_deref(), worker_cancelled.clone());
+            worker_pending.lock().unwrap().remove(&song.video_id);
+            if events.send_blocking((song, result)).is_err() { break; }
         });
-        (Self { sender, pending, cancelled }, updates)
+        (Self { waiting, pending, cancelled }, updates)
     }
 
     pub fn enqueue(&self, song: &Song) {
-        let mut pending = self.pending.lock().unwrap();
-        if pending.insert(song.video_id.clone()) && self.sender.send(song.clone()).is_err() {
-            pending.remove(&song.video_id);
+        if self.pending.lock().unwrap().insert(song.video_id.clone()) {
+            self.waiting.0.lock().unwrap().push_back(song.clone());
+            self.waiting.1.notify_one();
         }
+    }
+
+    /// Downloads `song` before the other waiting songs, for a song that is about to play.
+    pub fn enqueue_next(&self, song: &Song) {
+        let new = self.pending.lock().unwrap().insert(song.video_id.clone());
+        let mut songs = self.waiting.0.lock().unwrap();
+        // A pending song that is no longer waiting is already downloading.
+        if !new && !songs.iter().any(|waiting| waiting.video_id == song.video_id) { return; }
+        songs.retain(|waiting| waiting.video_id != song.video_id);
+        songs.push_front(song.clone());
+        drop(songs);
+        self.waiting.1.notify_one();
     }
 
     pub fn is_pending(&self, id: &str) -> bool {
@@ -238,7 +301,10 @@ impl Queue {
 }
 
 impl Drop for Queue {
-    fn drop(&mut self) { self.cancelled.store(true, Ordering::Relaxed); }
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.waiting.1.notify_one();
+    }
 }
 
 #[cfg(test)]
@@ -256,7 +322,7 @@ mod tests {
         assert!(local_art(&directory, "example").is_none());
         std::fs::write(audio.with_extension("cover"), &cover).unwrap();
         let song = Song { video_id: "example".into(), title: "Song".into(), artist: None,
-            album_art_url: Some("http://127.0.0.1:9/unavailable".into()), artists: vec![], source_url: None };
+            album_art_url: Some("http://127.0.0.1:9/unavailable".into()), artists: vec![], source_url: None, section: None };
         assert_eq!(download(&directory, &song, None, Arc::new(AtomicBool::new(false))).unwrap(), audio);
         assert_eq!(std::fs::read(local_art(&directory, "example").unwrap()).unwrap(), cover);
         std::fs::remove_dir_all(directory).unwrap();

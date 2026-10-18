@@ -584,9 +584,11 @@ impl Ui {
         let artist = if song.artists.is_empty() { song.artist.clone() }
             else { Some(song.artists.iter().map(|artist| artist.name.as_str()).collect::<Vec<_>>().join(", ")) };
         // Discord fetches art itself, so only public images work, not downloaded copies.
-        let art_url = song.album_art_url.as_deref().filter(|url| url.starts_with("https://") || url.starts_with("http://"))
-            .map(oxidance::high_quality_art_url);
-        Some(discord::Activity { title: song.title, artist: artist.filter(|artist| !artist.trim().is_empty()), start_ms, end_ms, art_url })
+        // The larger version doesn't always exist, so the original is the fallback.
+        let mut art_urls: Vec<String> = song.album_art_url.iter().filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+            .flat_map(|url| [oxidance::high_quality_art_url(url), url.clone()]).collect();
+        art_urls.dedup();
+        Some(discord::Activity { title: song.title, artist: artist.filter(|artist| !artist.trim().is_empty()), start_ms, end_ms, art_urls })
     }
 
     fn update_sidebar_art(&self) {
@@ -706,8 +708,11 @@ impl Ui {
         glib::spawn_future_local(async move {
             while let Ok((song, result)) = events.recv().await {
                 let Some(ui) = weak.upgrade() else { break; };
+                let current = ui.current_song.borrow().clone().filter(|current| current.video_id == song.video_id);
+                let waiting = current.filter(|_| ui.resolving.get() && ui.player.borrow().is_none());
                 match result {
                     Ok(_) => {
+                        if let Some(current) = &waiting { ui.load_song(current, ui.desired_playing.get(), 1, None); }
                         ui.download_completed(&song.video_id);
                         if let Some(path) = downloads::local_art(&ui.music_directory, &song.video_id) {
                             Self::refresh_saved_art(ui.list.upcast_ref(), &song.video_id, &path);
@@ -715,6 +720,11 @@ impl Ui {
                                 ui.playback_art.set_from_file(Some(path));
                             }
                         }
+                    }
+                    Err(error) if waiting.is_some() => {
+                        ui.update_download_spinners();
+                        ui.resolving.set(false);
+                        ui.playback_failed(&error);
                     }
                     Err(error) => {
                         ui.update_download_spinners();
@@ -1599,6 +1609,14 @@ impl Ui {
             if let Err(error) = self.start_stream(stream, generation) { self.playback_failed(&error); }
             return;
         }
+        if song.section.is_some() {
+            // A song cut from a longer video can't be streamed; it plays once its file is saved.
+            match self.download_queue.borrow().as_ref() {
+                Some(queue) => queue.enqueue_next(song),
+                None => { self.resolving.set(false); self.playback_failed("This song hasn’t been saved yet"); }
+            }
+            return;
+        }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         *self.resolve_cancel.borrow_mut() = Some(cancel.clone());
         let page = song.page_url();
@@ -2129,7 +2147,7 @@ mod tests {
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let ui = Ui::new(&app, std::env::temp_dir().join(format!("oxidance-back-test-{}/library.json", std::process::id())));
-        ui.library.borrow_mut().liked = (0..40).map(|index| Song { video_id: format!("song{index}"), title: format!("Track {index}"), artist: Some("Artist".into()), album_art_url: None, artists: vec![], source_url: None }).collect();
+        ui.library.borrow_mut().liked = (0..40).map(|index| Song { video_id: format!("song{index}"), title: format!("Track {index}"), artist: Some("Artist".into()), album_art_url: None, artists: vec![], source_url: None, section: None }).collect();
         let settle = || {
             let deadline = std::time::Instant::now() + Duration::from_millis(250);
             while std::time::Instant::now() < deadline { pump(); std::thread::sleep(Duration::from_millis(10)); }
@@ -2182,7 +2200,7 @@ mod tests {
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let ui = Ui::new(&app, std::env::temp_dir().join(format!("oxidance-album-test-{}/library.json", std::process::id())));
-        let song = |id: &str| Song { video_id: id.into(), title: format!("Track {id}"), artist: None, album_art_url: None, artists: vec![], source_url: None };
+        let song = |id: &str| Song { video_id: id.into(), title: format!("Track {id}"), artist: None, album_art_url: None, artists: vec![], source_url: None, section: None };
         let artist = |id: &str, name: &str| oxidance::artists::Artist { link: oxidance::ArtistLink { id: id.into(), name: name.into() }, image_url: None };
         let album = |id: &str| oxidance::artists::Album { id: id.into(), title: format!("Album {id}"), subtitle: "Album • Artist • 2022".into(), image_url: None };
         // Suggestions stay on top in their own order; full results follow without duplicates.
@@ -2266,7 +2284,7 @@ mod tests {
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let ui = Ui::new(&app, directory.join("library.json"));
         *ui.mpris.borrow_mut() = Some(mpris::Service::new(&ui).unwrap());
-        let first = Song { video_id: "first".into(), title: "First".into(), artist: Some("Artist".into()), album_art_url: None, artists: vec![], source_url: None };
+        let first = Song { video_id: "first".into(), title: "First".into(), artist: Some("Artist".into()), album_art_url: None, artists: vec![], source_url: None, section: None };
         let second = Song { video_id: "second".into(), title: "Second".into(), ..first.clone() };
         ui.library.borrow_mut().liked = vec![first.clone(), second];
         ui.navigate(View::Liked);
@@ -2350,8 +2368,8 @@ mod tests {
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let ui = Ui::new(&app, std::env::temp_dir().join(format!("oxidance-collection-test-{}/library.json", std::process::id())));
         assert_eq!(ui.search_controls.visible_child_name().as_deref(), Some("title"), "search stays hidden until requested");
-        let first = Song { video_id: "first".into(), title: "Blind Spots".into(), artist: Some("C418".into()), album_art_url: None, artists: vec![], source_url: None };
-        let second = Song { video_id: "second".into(), title: "By and By".into(), artist: Some("nitsua".into()), album_art_url: None, artists: vec![], source_url: None };
+        let first = Song { video_id: "first".into(), title: "Blind Spots".into(), artist: Some("C418".into()), album_art_url: None, artists: vec![], source_url: None, section: None };
+        let second = Song { video_id: "second".into(), title: "By and By".into(), artist: Some("nitsua".into()), album_art_url: None, artists: vec![], source_url: None, section: None };
         ui.library.borrow_mut().liked = vec![first.clone(), second];
         let id = ui.library.borrow_mut().create_playlist("Test").unwrap();
         ui.library.borrow_mut().playlists[0].songs.push(first);
@@ -2418,7 +2436,7 @@ mod tests {
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let directory = std::env::temp_dir().join(format!("oxidance-scroll-test-{}", std::process::id()));
         let ui = Ui::new(&app, directory.join("library.json"));
-        let song = Song { video_id: "first".into(), title: "First".into(), artist: None, album_art_url: None, artists: vec![], source_url: None };
+        let song = Song { video_id: "first".into(), title: "First".into(), artist: None, album_art_url: None, artists: vec![], source_url: None, section: None };
         *ui.artist_profile.borrow_mut() = Some(oxidance::artists::Profile {
             artist: oxidance::artists::Artist { link: oxidance::ArtistLink { id: "UCtest".into(), name: "Test artist".into() }, image_url: None },
             biography: Some("Biography\n".repeat(20)),
@@ -2468,7 +2486,7 @@ mod tests {
         pixbuf.fill(0x336699ff);
         std::fs::write(audio.with_extension("cover"), pixbuf.save_to_bufferv("png", &[]).unwrap()).unwrap();
         let song = Song { video_id: "offline".into(), title: "Offline song".into(), artist: None,
-            album_art_url: Some("http://127.0.0.1:9/unavailable".into()), artists: vec![], source_url: None };
+            album_art_url: Some("http://127.0.0.1:9/unavailable".into()), artists: vec![], source_url: None, section: None };
         ui.library.borrow_mut().toggle_like(&song);
         ui.navigate(View::Liked);
         let image = descendants(ui.list.upcast_ref()).into_iter().find_map(|widget| {
@@ -2522,7 +2540,7 @@ mod tests {
         assert!((12..14).contains(&position.seconds()), "resumed at {position}");
         // An unreachable network stream is retried with fresh URLs, then reported.
         ui.stop_player();
-        *ui.current_song.borrow_mut() = Some(Song { video_id: "xxxxxxxxxxx".into(), title: "Unavailable".into(), artist: None, album_art_url: None, artists: vec![], source_url: None });
+        *ui.current_song.borrow_mut() = Some(Song { video_id: "xxxxxxxxxxx".into(), title: "Unavailable".into(), artist: None, album_art_url: None, artists: vec![], source_url: None, section: None });
         ui.stream_attempt.set(1);
         ui.start_stream(playback::Stream { url: "http://127.0.0.1:9/stream.webm".into(), http_headers: Default::default() }, ui.playback_generation.get()).unwrap();
         wait(&|| ui.stream_attempt.get() == 3 && !ui.resolving.get() && ui.player.borrow().is_none(), 90);
@@ -2555,7 +2573,7 @@ mod tests {
         };
         settle();
         assert_eq!(ui.duration.text(), "0:30");
-        *ui.current_song.borrow_mut() = Some(Song { video_id: "tone".into(), title: "Tone".into(), artist: None, album_art_url: None, artists: vec![], source_url: None });
+        *ui.current_song.borrow_mut() = Some(Song { video_id: "tone".into(), title: "Tone".into(), artist: None, album_art_url: None, artists: vec![], source_url: None, section: None });
         ui.playback_bar.set_visible(true);
         let controllers = ui.window.observe_controllers();
         let keys = (0..controllers.n_items()).find_map(|index| controllers.item(index).unwrap().downcast::<gtk::EventControllerKey>().ok()).unwrap();
@@ -2597,7 +2615,7 @@ mod tests {
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let ui = Ui::new(&app, std::env::temp_dir().join(format!("oxidance-artwork-test-{}/library.json", std::process::id())));
-        *ui.current_song.borrow_mut() = Some(Song { video_id: "example".into(), title: "Example".into(), artist: None, album_art_url: None, artists: vec![], source_url: None });
+        *ui.current_song.borrow_mut() = Some(Song { video_id: "example".into(), title: "Example".into(), artist: None, album_art_url: None, artists: vec![], source_url: None, section: None });
         ui.playback_bar.set_visible(true);
         gtk::prelude::WidgetExt::activate_action(&ui.window, "win.preferences", None).unwrap();
         pump();
@@ -2740,7 +2758,7 @@ mod tests {
         let path = directory.join("library.json");
         let ui = Ui::new(&app, path.clone());
         pump();
-        let song = Song { video_id: "example".into(), title: "A & B <song>".into(), artist: Some("Artist".into()), album_art_url: None, artists: vec![], source_url: None };
+        let song = Song { video_id: "example".into(), title: "A & B <song>".into(), artist: Some("Artist".into()), album_art_url: None, artists: vec![], source_url: None, section: None };
         ui.ranked.borrow_mut().push(SearchItem::Song(song.clone()));
         ui.render();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -2865,7 +2883,7 @@ mod tests {
         // Resolve a real song, decode its stream, and exercise the actual play/pause control.
         let stream_song = Song {
             video_id: "5NV6Rdv1a3I".into(), title: "Get Lucky".into(),
-            artist: Some("Daft Punk".into()), album_art_url: Some("https://i.ytimg.com/vi/5NV6Rdv1a3I/hqdefault.jpg".into()), artists: vec![], source_url: None,
+            artist: Some("Daft Punk".into()), album_art_url: Some("https://i.ytimg.com/vi/5NV6Rdv1a3I/hqdefault.jpg".into()), artists: vec![], source_url: None, section: None,
         };
         ui.play_song(&stream_song);
         let deadline = std::time::Instant::now() + Duration::from_secs(75);

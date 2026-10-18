@@ -434,7 +434,7 @@ mod tests {
         let url = dav.url.clone();
         assert_eq!(url.path(), "/oxidance/");
         assert!(Dav::connect(url.as_str(), "test".into(), "wrong".into()).err().unwrap().contains("rejected"));
-        let song = |id: &str| Song { video_id: id.into(), title: format!("Title {id}"), artist: Some("Artist".into()), album_art_url: None, artists: vec![], source_url: None };
+        let song = |id: &str| Song { video_id: id.into(), title: format!("Title {id}"), artist: Some("Artist".into()), album_art_url: None, artists: vec![], source_url: None, section: None };
         let (events, _updates) = async_channel::unbounded();
         let device = |name: &str| {
             let directory = root.join(name);

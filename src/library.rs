@@ -200,7 +200,7 @@ mod tests {
     use super::*;
 
     fn song(id: &str) -> Song {
-        Song { video_id: id.into(), title: "Same title".into(), artist: None, album_art_url: None, artists: vec![], source_url: None }
+        Song { video_id: id.into(), title: "Same title".into(), artist: None, album_art_url: None, artists: vec![], source_url: None, section: None }
     }
 
     #[test]

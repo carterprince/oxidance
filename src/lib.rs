@@ -41,7 +41,7 @@ pub fn search_art_url(url: &str) -> String {
     match parsed.host_str() {
         Some("yt3.googleusercontent.com" | "lh3.googleusercontent.com" | "yt3.ggpht.com") =>
             resize_google_image(url, 240),
-        Some("i.ytimg.com") if parsed.path().starts_with("/vi/") =>
+        Some("i.ytimg.com") if is_video_thumbnail(url) =>
             format!("{}/mqdefault.jpg", url.rsplit_once('/').unwrap().0),
         Some("i.scdn.co") => url.replace("ab67616d0000b273", "ab67616d00001e02"),
         _ => url.to_owned(),
@@ -53,11 +53,57 @@ pub fn high_quality_art_url(url: &str) -> String {
         if parsed.host_str().is_some_and(|host| host == "yt3.googleusercontent.com" || host == "lh3.googleusercontent.com" || host == "yt3.ggpht.com") {
             return resize_google_image(url, 1200);
         }
-        if parsed.host_str() == Some("i.ytimg.com") && parsed.path().starts_with("/vi/") {
-            if let Some((base, _)) = url.rsplit_once('/') { return format!("{base}/maxresdefault.jpg"); }
-        }
+    }
+    if is_video_thumbnail(url) {
+        if let Some((base, _)) = url.rsplit_once('/') { return format!("{base}/maxresdefault.jpg"); }
     }
     url.to_owned()
+}
+
+/// Whether `url` is a YouTube video frame rather than album art. For songs
+/// uploaded as a still image, the square cover sits between black bars.
+pub fn is_video_thumbnail(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|parsed| parsed.host_str() == Some("i.ytimg.com") && parsed.path().starts_with("/vi/"))
+}
+
+/// Crops a video frame to a square around the cover between its black bars.
+/// The cover itself is never cropped or stretched: a cover that isn't square
+/// keeps black at its sides. Images without bars, or whose content is more than
+/// 4:3 from square, are returned unchanged.
+pub fn trim_letterbox(bytes: Vec<u8>) -> Vec<u8> {
+    use gtk::gdk_pixbuf::Pixbuf;
+    let Ok(pixbuf) = Pixbuf::from_read(std::io::Cursor::new(bytes.clone())) else { return bytes; };
+    let Some((x, y, width, height)) = letterbox_content(&pixbuf) else { return bytes; };
+    let content = pixbuf.new_subpixbuf(x, y, width, height);
+    let side = width.max(height);
+    let square = if width == height { Some(content) } else {
+        Pixbuf::new(content.colorspace(), content.has_alpha(), 8, side, side).inspect(|square| {
+            square.fill(0x000000ff);
+            content.copy_area(0, 0, width, height, square, (side - width) / 2, (side - height) / 2);
+        })
+    };
+    let Some(cropped) = square else { return bytes; };
+    let saved = if cropped.has_alpha() { cropped.save_to_bufferv("png", &[]) } else { cropped.save_to_bufferv("jpeg", &[("quality", "95")]) };
+    saved.unwrap_or(bytes)
+}
+
+/// The content inside the image's dark borders, if it has any.
+fn letterbox_content(pixbuf: &gtk::gdk_pixbuf::Pixbuf) -> Option<(i32, i32, i32, i32)> {
+    let (width, height) = (pixbuf.width() as usize, pixbuf.height() as usize);
+    let (stride, channels) = (pixbuf.rowstride() as usize, pixbuf.n_channels() as usize);
+    let pixels = pixbuf.read_pixel_bytes();
+    // JPEG noise keeps the bars from being exactly black.
+    let dark = |x: usize, y: usize| pixels[y * stride + x * channels..][..3].iter().all(|&value| value <= 24);
+    let left = (0..width).take_while(|&x| (0..height).all(|y| dark(x, y))).count();
+    if left == width { return None; }
+    let right = width - (0..width).rev().take_while(|&x| (0..height).all(|y| dark(x, y))).count();
+    let top = (0..height).take_while(|&y| (left..right).all(|x| dark(x, y))).count();
+    let bottom = height - (0..height).rev().take_while(|&y| (left..right).all(|x| dark(x, y))).count();
+    let (content_width, content_height) = (right - left, bottom - top);
+    let trimmed = content_width < width || content_height < height;
+    // Old uploads often stretch the cover, so allow up to 4:3.
+    let near_square = content_width.max(content_height) * 3 <= content_width.min(content_height) * 4;
+    (trimmed && near_square).then_some((left as i32, top as i32, content_width as i32, content_height as i32))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -78,6 +124,17 @@ pub struct Song {
     /// YouTube songs leave it empty and are found by `video_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+    /// The part of a longer video this song is, such as one track of a full album.
+    /// It plays from its own downloaded file, cut from the video's audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<Section>,
+}
+
+/// A span of a video's audio, in seconds.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Section {
+    pub start: f64,
+    pub end: f64,
 }
 
 impl Song {
@@ -93,8 +150,9 @@ pub fn fetch_image(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<
     if let Some(path) = reqwest::Url::parse(url).ok().filter(|url| url.scheme() == "file").and_then(|url| url.to_file_path().ok()) {
         return std::fs::read(path).map_err(|error| error.to_string());
     }
-    client.get(url).send().and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(reqwest::blocking::Response::bytes).map(|bytes| bytes.to_vec()).map_err(|error| error.to_string())
+    let bytes = client.get(url).send().and_then(reqwest::blocking::Response::error_for_status)
+        .and_then(reqwest::blocking::Response::bytes).map(|bytes| bytes.to_vec()).map_err(|error| error.to_string())?;
+    Ok(if is_video_thumbnail(url) { trim_letterbox(bytes) } else { bytes })
 }
 
 pub(crate) fn text(value: &Value) -> String {
@@ -132,7 +190,7 @@ pub(crate) fn parse_song(renderer: &Value) -> Option<Song> {
         .and_then(|images| images.iter().filter(|image| image["url"].is_string())
             .max_by_key(|image| image["width"].as_u64().unwrap_or(0) * image["height"].as_u64().unwrap_or(0)))
         .and_then(|image| image["url"].as_str()).map(str::to_owned);
-    Some(Song { video_id: video_id.to_owned(), title, artist: (!artists.is_empty()).then(|| artists.join(", ")), album_art_url, artists: links, source_url: None })
+    Some(Song { video_id: video_id.to_owned(), title, artist: (!artists.is_empty()).then(|| artists.join(", ")), album_art_url, artists: links, source_url: None, section: None })
 }
 
 const PAGE_SIZE: usize = 25;
@@ -235,6 +293,42 @@ pub fn search(query: &str) -> Result<Vec<Song>, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trims_bars_around_square_cover() {
+        use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
+        let frame = Pixbuf::new(Colorspace::Rgb, false, 8, 160, 90).unwrap();
+        frame.fill(0x000000ff);
+        frame.new_subpixbuf(35, 0, 90, 90).fill(0xe0c020ff);
+        let trimmed = Pixbuf::from_read(std::io::Cursor::new(trim_letterbox(frame.save_to_bufferv("jpeg", &[]).unwrap()))).unwrap();
+        assert!((88..=90).contains(&trimmed.width()) && trimmed.width() == trimmed.height(), "{}x{}", trimmed.width(), trimmed.height());
+
+        // A wider cover keeps all of its width, with black above and below.
+        frame.fill(0x000000ff);
+        frame.new_subpixbuf(28, 0, 104, 90).fill(0xe0c020ff);
+        frame.new_subpixbuf(28, 0, 8, 90).fill(0x2040e0ff);
+        let trimmed = Pixbuf::from_read(std::io::Cursor::new(trim_letterbox(frame.save_to_bufferv("jpeg", &[]).unwrap()))).unwrap();
+        assert_eq!((trimmed.width(), trimmed.height()), (104, 104));
+        let pixels = trimmed.read_pixel_bytes();
+        let row = 52 * trimmed.rowstride() as usize;
+        assert!(pixels[row + 2] > 150 && pixels[row + 103 * 3] > 150, "the cover's edges must remain");
+        assert!(pixels[..3].iter().all(|&value| value < 30), "black above the cover");
+
+        // A narrower cover keeps its shape, with black at its sides.
+        frame.fill(0x000000ff);
+        frame.new_subpixbuf(40, 0, 80, 90).fill(0xe0c020ff);
+        let trimmed = Pixbuf::from_read(std::io::Cursor::new(trim_letterbox(frame.save_to_bufferv("jpeg", &[]).unwrap()))).unwrap();
+        assert_eq!((trimmed.width(), trimmed.height()), (90, 90));
+        let pixels = trimmed.read_pixel_bytes();
+        let row = 45 * trimmed.rowstride() as usize;
+        assert!(pixels[row] < 30 && pixels[row + 45 * 3] > 150, "black sides around the unstretched cover");
+
+        // A wide image with bars stays as it is.
+        frame.fill(0x000000ff);
+        frame.new_subpixbuf(10, 0, 140, 90).fill(0xe0c020ff);
+        let bytes = frame.save_to_bufferv("jpeg", &[]).unwrap();
+        assert_eq!(trim_letterbox(bytes.clone()), bytes);
+    }
 
     fn song_renderer() -> Value {
         json!({

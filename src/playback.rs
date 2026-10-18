@@ -128,6 +128,17 @@ pub fn resolve(page_url: &str, cancelled: Arc<AtomicBool>) -> Result<Stream, Str
 pub struct Detected {
     pub song: oxidance::Song,
     pub stream: Stream,
+    /// The songs in a YouTube video of several, such as a full album, from its chapters.
+    pub chapters: Vec<Chapter>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Chapter {
+    pub title: String,
+    #[serde(rename = "start_time")]
+    pub start: f64,
+    #[serde(rename = "end_time")]
+    pub end: f64,
 }
 
 #[derive(Deserialize)]
@@ -144,12 +155,39 @@ struct Info {
     uploader: Option<String>,
     channel: Option<String>,
     thumbnail: Option<String>,
+    chapters: Option<Vec<Chapter>>,
     #[serde(flatten)]
     stream: Option<Stream>,
 }
 
 fn nonempty(text: Option<String>) -> Option<String> {
     text.map(|text| text.trim().to_owned()).filter(|text| !text.is_empty())
+}
+
+/// Removes a chapter's leading track number, as in "1. Song" or "02 Song".
+fn track_title(title: &str) -> String {
+    let title = title.trim();
+    let digits = title.bytes().take_while(u8::is_ascii_digit).count();
+    let separator = |character: char| matches!(character, '.' | ')' | ':' | '-' | '–' | '—');
+    if (1..=3).contains(&digits) {
+        let rest = &title[digits..];
+        let stripped = rest.trim_start_matches(|character: char| separator(character) || character.is_whitespace());
+        let numbered = rest.starts_with(separator) || title.starts_with('0') && rest.starts_with(' ');
+        if numbered && !stripped.is_empty() { return stripped.to_owned(); }
+    }
+    title.to_owned()
+}
+
+/// The artist in a video title such as "[Full Album] Artist - Album".
+fn title_artist(title: &str) -> Option<String> {
+    let mut title = title.trim();
+    while let Some(end) = [('[', ']'), ('(', ')'), ('【', '】')].iter()
+        .find(|(open, _)| title.starts_with(*open))
+        .and_then(|(_, close)| title.find(*close).map(|index| index + close.len_utf8())) {
+        title = title[end..].trim_start();
+    }
+    let index = [" - ", " – ", " — "].iter().filter_map(|separator| title.find(separator)).min()?;
+    nonempty(Some(title[..index].to_owned()))
 }
 
 /// Turns yt-dlp's description of a link into a song. YouTube links become ordinary
@@ -162,13 +200,22 @@ fn detected(info: Info, url: &str) -> Result<Detected, String> {
     let youtube = info.extractor_key == "Youtube";
     let id: String = if youtube { info.id.clone() } else { format!("{}-{}", info.extractor_key, info.id) }
         .chars().map(|character| if character.is_ascii_alphanumeric() || character == '-' || character == '_' { character } else { '_' }).collect();
+    let chapters: Vec<Chapter> = info.chapters.filter(|_| youtube).unwrap_or_default().into_iter()
+        .filter(|chapter| chapter.end > chapter.start)
+        .map(|chapter| Chapter { title: track_title(&chapter.title), ..chapter }).collect();
+    let chapters = if chapters.len() >= 2 { chapters } else { vec![] };
+    // A full album's video is usually titled "Artist - Album", and uploaded by someone else.
+    let titled_artist = info.title.as_deref().filter(|_| !chapters.is_empty()).and_then(title_artist);
     let title = nonempty(info.track).or(nonempty(info.title)).unwrap_or_default();
-    let artist = nonempty(info.artist).or(nonempty(info.creator)).or(nonempty(info.uploader)).or(nonempty(info.channel));
+    let artist = nonempty(info.artist).or(titled_artist).or(nonempty(info.creator)).or(nonempty(info.uploader)).or(nonempty(info.channel));
+    // yt-dlp may choose a WebP thumbnail; every video has this JPEG, upgraded where a larger one exists.
+    let thumbnail = if youtube { Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", info.id)) } else { nonempty(info.thumbnail) };
     let song = oxidance::Song {
-        video_id: id, title, artist, album_art_url: nonempty(info.thumbnail), artists: vec![],
+        video_id: id, title, artist, album_art_url: thumbnail, artists: vec![],
         source_url: (!youtube).then(|| nonempty(info.webpage_url).unwrap_or_else(|| url.to_owned())),
+        section: None,
     };
-    Ok(Detected { song, stream })
+    Ok(Detected { song, stream, chapters })
 }
 
 /// Detects the song at a link to any site yt-dlp supports.
@@ -256,13 +303,43 @@ mod detect_tests {
         let detected = super::detected(youtube, "https://youtu.be/5NV6Rdv1a3I").unwrap();
         assert_eq!(detected.song.video_id, "5NV6Rdv1a3I");
         assert!(detected.song.source_url.is_none(), "YouTube links are ordinary songs");
-        assert!(detected.song.artist.is_none() && detected.song.album_art_url.is_none());
+        assert!(detected.song.artist.is_none() && detected.chapters.is_empty());
+        assert_eq!(detected.song.album_art_url.as_deref(), Some("https://i.ytimg.com/vi/5NV6Rdv1a3I/hqdefault.jpg"));
 
         let odd = info(serde_json::json!({"id": "a/b c", "extractor_key": "Generic", "title": " ", "url": "https://example.com/a.mp3"}));
         let detected = super::detected(odd, "https://example.com/a.mp3").unwrap();
         assert_eq!(detected.song.video_id, "Generic-a_b_c");
         assert_eq!(detected.song.title, "", "a missing title is left for the user");
         assert_eq!(detected.song.page_url(), "https://example.com/a.mp3");
+    }
+
+    #[test]
+    fn full_album_videos_list_their_chapters_as_songs() {
+        let album = info(serde_json::json!({
+            "id": "1Jp6ne59-4U", "extractor_key": "Youtube", "title": "[Full Album] CECIL - 夏時計 [EP, 2002]",
+            "uploader": "Uploader", "url": "https://example.com/a",
+            "chapters": [
+                {"start_time": 0.0, "title": "1. 夏時計 (Summer Clock)", "end_time": 120.0},
+                {"start_time": 120.0, "title": "2.シトロエン (Citroen)", "end_time": 331.0},
+                {"start_time": 331.0, "title": "1999", "end_time": 400.0},
+            ]
+        }));
+        let detected = detected(album, "https://youtu.be/1Jp6ne59-4U").unwrap();
+        assert_eq!(detected.song.artist.as_deref(), Some("CECIL"));
+        let titles: Vec<_> = detected.chapters.iter().map(|chapter| chapter.title.as_str()).collect();
+        assert_eq!(titles, ["夏時計 (Summer Clock)", "シトロエン (Citroen)", "1999"]);
+        assert_eq!((detected.chapters[1].start, detected.chapters[1].end), (120.0, 331.0));
+
+        assert_eq!(track_title("02 Song"), "Song");
+        assert_eq!(track_title("3) Song"), "Song");
+        assert_eq!(track_title("99 Luftballons"), "99 Luftballons");
+        assert_eq!(title_artist("Artist – Album (Full Album)").as_deref(), Some("Artist"));
+        assert_eq!(title_artist("Just a title"), None);
+
+        // A single chapter is not a list of songs, and other sites don't split.
+        let single = info(serde_json::json!({"id": "a", "extractor_key": "Youtube", "url": "https://example.com/a",
+            "chapters": [{"start_time": 0.0, "title": "Intro", "end_time": 10.0}]}));
+        assert!(super::detected(single, "https://youtu.be/a").unwrap().chapters.is_empty());
     }
 
     #[test]

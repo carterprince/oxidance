@@ -1,6 +1,7 @@
 //! Adds songs from links to other sites, such as Bandcamp or SoundCloud.
 //! yt-dlp detects the title, artist, and cover; the user fills in anything it
-//! missed and can listen to a preview before adding the song.
+//! missed and can listen to a preview before adding the song. A YouTube video
+//! with chapters, such as a full album, can be added as one song per chapter.
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use super::*;
@@ -18,6 +19,9 @@ pub struct AddLink {
     fields: adw::PreferencesGroup,
     title: adw::EntryRow,
     artist: adw::EntryRow,
+    split: adw::SwitchRow,
+    chapter_group: adw::PreferencesGroup,
+    chapters: RefCell<Vec<ChapterRow>>,
     preview: gtk::Button,
     position: gtk::Scale,
     time: gtk::Label,
@@ -32,6 +36,15 @@ pub struct AddLink {
     cancel: RefCell<Option<Arc<AtomicBool>>>,
     player: RefCell<Option<gst::Element>>,
     bus_watch: RefCell<Option<gst::bus::BusWatchGuard>>,
+    /// Where to start the preview once it has loaded, for previewing a chapter.
+    pending_seek: Cell<Option<f64>>,
+}
+
+/// A chapter of the detected video, which the user can choose to add as a song.
+struct ChapterRow {
+    chapter: playback::Chapter,
+    check: gtk::CheckButton,
+    entry: adw::EntryRow,
 }
 
 fn target_name(ui: &Ui, target: View) -> Option<String> {
@@ -72,7 +85,7 @@ pub fn present(ui: &Rc<Ui>) -> Option<Rc<AddLink>> {
     page.set_size_request(440, -1);
 
     let link_group = adw::PreferencesGroup::builder()
-        .description("Paste a link to a song on Bandcamp, SoundCloud, or another site.").build();
+        .description("Paste a link to a song on Bandcamp, SoundCloud, or another site, or to a full album on YouTube.").build();
     let link = adw::EntryRow::builder().title("Link").build();
     link.set_input_purpose(gtk::InputPurpose::Url);
     let find = gtk::Button::builder().label("Find").valign(gtk::Align::Center).css_classes(["flat"]).build();
@@ -120,9 +133,13 @@ pub fn present(ui: &Rc<Ui>) -> Option<Rc<AddLink>> {
     let fields = adw::PreferencesGroup::new();
     let title = adw::EntryRow::builder().title("Title").build();
     let artist = adw::EntryRow::builder().title("Artist").build();
+    let split = adw::SwitchRow::builder().title("Split Into Songs").visible(false).build();
     fields.add(&title);
     fields.add(&artist);
+    fields.add(&split);
     details.append(&fields);
+    let chapter_group = adw::PreferencesGroup::builder().title("Songs").visible(false).build();
+    details.append(&chapter_group);
     page.append(&details);
 
     let scroll = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never)
@@ -137,9 +154,10 @@ pub fn present(ui: &Rc<Ui>) -> Option<Rc<AddLink>> {
 
     let this = Rc::new(AddLink {
         ui: Rc::downgrade(ui), target, dialog, link, find, spinner, status, details, cover, fields, title, artist,
-        preview, position, time, add,
+        split, chapter_group, chapters: RefCell::new(vec![]), preview, position, time, add,
         song: RefCell::new(None), stream: RefCell::new(None), chosen_cover: RefCell::new(None), chooser: RefCell::new(None),
         request: Cell::new(0), cancel: RefCell::new(None), player: RefCell::new(None), bus_watch: RefCell::new(None),
+        pending_seek: Cell::new(None),
     });
     this.show_preview_state(false);
     let weak = Rc::downgrade(&this);
@@ -148,6 +166,7 @@ pub fn present(ui: &Rc<Ui>) -> Option<Rc<AddLink>> {
     for row in [&this.title, &this.artist] {
         row.connect_changed({ let weak = weak.clone(); move |_| { if let Some(this) = weak.upgrade() { this.update_details(); } }});
     }
+    this.split.connect_active_notify({ let weak = weak.clone(); move |_| { if let Some(this) = weak.upgrade() { this.update_details(); } }});
     this.preview.connect_clicked({ let weak = weak.clone(); move |_| { if let Some(this) = weak.upgrade() { this.toggle_preview(); } }});
     this.position.connect_change_value({ let weak = weak.clone(); move |_, _, seconds| {
         if let Some(this) = weak.upgrade() && let Some(player) = this.player.borrow().as_ref() {
@@ -196,6 +215,7 @@ impl AddLink {
         self.song.take();
         self.stream.take();
         self.chosen_cover.take();
+        self.show_chapters(vec![]);
         self.details.set_visible(false);
         self.add.set_sensitive(false);
         self.spinner.set_visible(true);
@@ -212,13 +232,13 @@ impl AddLink {
             this.cancel.take();
             this.spinner.set_visible(false);
             match result {
-                Ok(detected) => this.show(detected.song, detected.stream, request),
+                Ok(detected) => this.show(detected.song, detected.stream, detected.chapters, request),
                 Err(error) => this.set_status(Some(&error), true),
             }
         });
     }
 
-    fn show(self: &Rc<Self>, song: Song, stream: playback::Stream, request: u64) {
+    fn show(self: &Rc<Self>, song: Song, stream: playback::Stream, chapters: Vec<playback::Chapter>, request: u64) {
         self.set_status(None, false);
         self.title.set_text(&song.title);
         self.artist.set_text(song.artist.as_deref().unwrap_or_default());
@@ -226,6 +246,7 @@ impl AddLink {
         let art = song.album_art_url.clone();
         *self.song.borrow_mut() = Some(song);
         *self.stream.borrow_mut() = Some(stream);
+        self.show_chapters(chapters);
         self.show_preview_state(false);
         self.details.set_visible(true);
         self.update_details();
@@ -250,11 +271,55 @@ impl AddLink {
         });
     }
 
+    /// Lists the video's chapters, each checked to be added as a song.
+    fn show_chapters(self: &Rc<Self>, chapters: Vec<playback::Chapter>) {
+        for row in self.chapters.take() { self.chapter_group.remove(&row.entry); }
+        self.split.set_visible(!chapters.is_empty());
+        self.split.set_subtitle(&format!("Add each of the video’s {} chapters as its own song", chapters.len()));
+        self.split.set_active(!chapters.is_empty());
+        let weak = Rc::downgrade(self);
+        for (index, chapter) in chapters.into_iter().enumerate() {
+            let length = format_time((chapter.end - chapter.start).round() as u64);
+            let entry = adw::EntryRow::builder().title(format!("{} · {length}", index + 1)).text(&chapter.title).build();
+            let check = gtk::CheckButton::builder().active(true).valign(gtk::Align::Center).tooltip_text("Add this song").build();
+            entry.add_prefix(&check);
+            let play = gtk::Button::builder().icon_name("media-playback-start-symbolic").valign(gtk::Align::Center)
+                .tooltip_text("Preview this song").css_classes(["flat", "circular"]).build();
+            entry.add_suffix(&play);
+            check.connect_toggled({ let weak = weak.clone(); move |_| { if let Some(this) = weak.upgrade() { this.update_details(); } }});
+            entry.connect_changed({ let weak = weak.clone(); move |_| { if let Some(this) = weak.upgrade() { this.update_details(); } }});
+            play.connect_clicked({ let weak = weak.clone(); let start = chapter.start; move |_| {
+                if let Some(this) = weak.upgrade() { this.preview_from(start); }
+            }});
+            self.chapter_group.add(&entry);
+            self.chapters.borrow_mut().push(ChapterRow { chapter, check, entry });
+        }
+    }
+
+    fn splitting(&self) -> bool { self.split.is_visible() && self.split.is_active() }
+
+    /// The song for one chapter of the detected video.
+    fn chapter_song(&self, video: &Song, row: &ChapterRow) -> Song {
+        let playback::Chapter { start, end, .. } = row.chapter;
+        Song {
+            video_id: format!("{}-t{}", video.video_id, start.round() as u64),
+            title: row.entry.text().trim().to_owned(),
+            artist: Some(self.artist.text().trim().to_owned()).filter(|artist| !artist.is_empty()),
+            album_art_url: video.album_art_url.clone(), artists: vec![],
+            source_url: Some(format!("https://www.youtube.com/watch?v={}", video.video_id)),
+            section: Some(oxidance::Section { start, end }),
+        }
+    }
+
     /// Asks for missing details, and allows adding once the song has a title.
     fn update_details(&self) {
         let Some(ui) = self.ui.upgrade() else { return; };
         let song = self.song.borrow();
         let Some(song) = song.as_ref() else { return; };
+        if self.splitting() { return self.update_chapters(&ui, song); }
+        self.title.set_visible(true);
+        self.chapter_group.set_visible(false);
+        self.add.set_label(&format!("Add to {}", target_name(&ui, self.target).unwrap_or_default()));
         let mut missing = Vec::new();
         if self.title.text().trim().is_empty() { missing.push("title"); }
         if self.artist.text().trim().is_empty() { missing.push("artist"); }
@@ -273,6 +338,42 @@ impl AddLink {
             self.set_status(Some(&format!("This song is already in {name}.")), true);
         }
         self.add.set_sensitive(ui.writable && !duplicate && !self.title.text().trim().is_empty());
+    }
+
+    /// Like `update_details`, for adding the checked chapters as songs.
+    fn update_chapters(&self, ui: &Ui, video: &Song) {
+        self.title.set_visible(false);
+        self.chapter_group.set_visible(true);
+        let name = target_name(ui, self.target).unwrap_or_default();
+        let mut missing = Vec::new();
+        if self.artist.text().trim().is_empty() { missing.push("artist"); }
+        if video.album_art_url.is_none() && self.chosen_cover.borrow().is_none() { missing.push("cover"); }
+        if missing.contains(&"artist") { self.artist.add_css_class("warning"); } else { self.artist.remove_css_class("warning"); }
+        self.title.remove_css_class("warning");
+        self.fields.set_description(Some(&if missing.is_empty() {
+            "Every song uses this artist and cover.".to_owned()
+        } else {
+            format!("Couldn’t detect {}. Add {} below.", join_missing(&missing), if missing.len() == 1 { "it" } else { "them" })
+        }));
+        let (mut chosen, mut untitled, mut added) = (0, false, 0);
+        for row in self.chapters.borrow().iter() {
+            let duplicate = contains(&ui.library.borrow(), self.target, &self.chapter_song(video, row));
+            row.check.set_sensitive(!duplicate);
+            row.entry.set_tooltip_text(duplicate.then(|| format!("Already in {name}")).as_deref());
+            if duplicate { added += 1; }
+            let selected = row.check.is_active() && !duplicate;
+            let empty = row.entry.text().trim().is_empty();
+            if selected && empty { row.entry.add_css_class("warning"); } else { row.entry.remove_css_class("warning"); }
+            if selected { chosen += 1; untitled |= empty; }
+        }
+        let total = self.chapters.borrow().len();
+        self.chapter_group.set_description(Some(&match added {
+            0 => "Uncheck any songs you don’t want. Each is saved as its own file.".to_owned(),
+            added if added == total => format!("These songs are already in {name}."),
+            added => format!("{added} of these songs are already in {name}."),
+        }));
+        self.add.set_label(&format!("Add {chosen} {} to {name}", if chosen == 1 { "Song" } else { "Songs" }));
+        self.add.set_sensitive(ui.writable && chosen > 0 && !untitled);
     }
 
     fn choose_cover(self: &Rc<Self>) {
@@ -307,7 +408,21 @@ impl AddLink {
             .label(if playing { "Pause Preview" } else { "Play Preview" }).build()));
     }
 
+    /// Plays the preview from `seconds` into the video, such as the start of a chapter.
+    fn preview_from(self: &Rc<Self>, seconds: f64) {
+        let player = self.player.borrow().clone();
+        let Some(player) = player else {
+            self.pending_seek.set(Some(seconds));
+            return self.toggle_preview();
+        };
+        let _ = player.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, gst::ClockTime::from_seconds_f64(seconds));
+        let _ = player.set_state(gst::State::Playing);
+        self.show_preview_state(true);
+        self.pause_library_playback();
+    }
+
     fn stop_preview(&self) {
+        self.pending_seek.take();
         self.bus_watch.take();
         if let Some(player) = self.player.take() { let _ = player.set_state(gst::State::Null); }
         self.position.set_sensitive(false);
@@ -357,6 +472,9 @@ impl AddLink {
                     this.stop_preview();
                     return glib::ControlFlow::Break;
                 }
+                gst::MessageView::AsyncDone(_) => if let Some(seconds) = this.pending_seek.take() && let Some(player) = this.player.borrow().as_ref() {
+                    let _ = player.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, gst::ClockTime::from_seconds_f64(seconds));
+                }
                 _ => {}
             }
             glib::ControlFlow::Continue
@@ -379,6 +497,7 @@ impl AddLink {
     }
 
     fn add(self: &Rc<Self>) {
+        if self.splitting() { return self.add_chapters(); }
         let Some(ui) = self.ui.upgrade() else { return; };
         let Some(mut song) = self.song.borrow().clone() else { return; };
         song.title = self.title.text().trim().to_owned();
@@ -396,6 +515,34 @@ impl AddLink {
         });
         if added {
             ui.toast(&format!("Added “{}”", song.title));
+            self.dialog.close();
+        }
+    }
+}
+
+impl AddLink {
+    fn add_chapters(self: &Rc<Self>) {
+        let Some(ui) = self.ui.upgrade() else { return; };
+        let Some(mut video) = self.song.borrow().clone() else { return; };
+        if let Some(path) = self.chosen_cover.borrow().as_ref() {
+            match copy_cover(&ui.path, &video.video_id, path) {
+                Ok(url) => video.album_art_url = Some(url),
+                Err(error) => { self.set_status(Some(&format!("Could not save the cover: {error}")), true); return; }
+            }
+        }
+        let songs: Vec<Song> = self.chapters.borrow().iter().filter(|row| row.check.is_active() && row.check.is_sensitive())
+            .map(|row| self.chapter_song(&video, row)).collect();
+        let target = self.target;
+        let added = ui.change(|library| {
+            match target {
+                View::Playlist(id) => for song in &songs { library.add_song(id, song)?; },
+                // Liking puts a song first, so like the last track first to keep the album's order.
+                _ => for song in songs.iter().rev() { library.like(song); },
+            }
+            Ok(())
+        });
+        if added {
+            ui.toast(&format!("Added {} {}", songs.len(), if songs.len() == 1 { "song" } else { "songs" }));
             self.dialog.close();
         }
     }
@@ -502,6 +649,74 @@ mod tests {
         assert!(audio.to_string_lossy().ends_with("[Bandcamp-2707922679].mp3"), "{audio:?}");
         let art = gtk::gdk_pixbuf::Pixbuf::from_file(downloads::local_art(&ui.music_directory, &song.video_id).unwrap()).unwrap();
         assert_eq!((art.width(), art.height()), (4, 4));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a desktop display and network access for yt-dlp"]
+    fn ui_add_chosen_chapters_of_full_album_video() {
+        adw::init().unwrap();
+        let app = adw::Application::builder().application_id("io.github.oxidance.AddChaptersTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let directory = std::env::temp_dir().join(format!("oxidance-add-chapters-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let ui = Ui::new(&app, directory.join("library.json"));
+        ui.start_download_queue();
+        ui.navigate(View::Liked);
+        let this = present(&ui).unwrap();
+        this.link.set_text("https://youtu.be/1Jp6ne59-4U");
+        this.find();
+        assert!(wait_until(60, || this.details.is_visible() || this.status.has_css_class("error")), "lookup did not finish");
+        assert!(this.details.is_visible(), "lookup failed: {}", this.status.text());
+        assert!(this.splitting() && !this.title.is_visible());
+        assert_eq!(this.artist.text(), "CECIL");
+        let titles: Vec<_> = this.chapters.borrow().iter().map(|row| row.entry.text().to_string()).collect();
+        assert_eq!(titles.len(), 6);
+        assert_eq!(titles[1], "シトロエン (Citroen)");
+        assert_eq!(this.add.label().unwrap(), "Add 6 Songs to Liked songs");
+
+        // Previewing a chapter starts the video at that chapter.
+        this.preview_from(120.0);
+        assert!(wait_until(30, || this.player.borrow().as_ref()
+            .and_then(|player| player.query_position::<gst::ClockTime>()).is_some_and(|position| position >= gst::ClockTime::from_seconds(120))),
+            "chapter preview must start at the chapter: {}", this.status.text());
+        this.toggle_preview();
+
+        // Only the checked songs are added, renamed as edited, in the album's order.
+        for (index, row) in this.chapters.borrow().iter().enumerate() { row.check.set_active(index == 0 || index == 1); }
+        this.chapters.borrow()[0].entry.set_text("");
+        assert!(!this.add.is_sensitive(), "a checked song needs a title");
+        this.chapters.borrow()[0].entry.set_text("Summer Clock");
+        assert_eq!(this.add.label().unwrap(), "Add 2 Songs to Liked songs");
+        this.add();
+        pump_for(Duration::from_millis(100));
+        let liked = ui.library.borrow().liked.clone();
+        let titles: Vec<_> = liked.iter().map(|song| song.title.as_str()).collect();
+        assert_eq!(titles, ["Summer Clock", "シトロエン (Citroen)"]);
+        assert_eq!(liked[1].video_id, "1Jp6ne59-4U-t120");
+        assert_eq!(liked[1].section, Some(oxidance::Section { start: 120.0, end: 331.0 }));
+        assert_eq!(liked[1].artist.as_deref(), Some("CECIL"));
+
+        // Adding again offers only the songs not yet added.
+        let again = present(&ui).unwrap();
+        again.link.set_text("https://youtu.be/1Jp6ne59-4U");
+        again.find();
+        assert!(wait_until(60, || again.details.is_visible()), "second lookup failed: {}", again.status.text());
+        assert!(!again.chapters.borrow()[1].check.is_sensitive());
+        assert_eq!(again.add.label().unwrap(), "Add 4 Songs to Liked songs");
+        again.dialog.close();
+
+        // Adding saves each song, cut from one download of the video at its chapter.
+        assert!(wait_until(180, || liked.iter().all(|song| downloads::local_file(&ui.music_directory, &song.video_id).is_some())),
+            "downloads did not finish");
+        for (song, seconds) in liked.iter().zip([120.0, 211.0]) {
+            let audio = downloads::local_file(&ui.music_directory, &song.video_id).expect("song must be saved");
+            let output = std::process::Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+                .arg(&audio).output().unwrap();
+            let duration: f64 = String::from_utf8_lossy(&output.stdout).trim().parse().unwrap();
+            assert!((duration - seconds).abs() < 0.5, "{audio:?} lasts {duration}s, not {seconds}s");
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

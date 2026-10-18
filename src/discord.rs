@@ -20,8 +20,9 @@ pub struct Activity {
     /// Wall-clock milliseconds when the song would have started and will end at the current speed.
     pub start_ms: i64,
     pub end_ms: Option<i64>,
-    /// A public image URL; Discord fetches it through its media proxy.
-    pub art_url: Option<String>,
+    /// Public image URLs, best first. Discord fetches art through its media proxy,
+    /// so it is given the first one that loads.
+    pub art_urls: Vec<String>,
 }
 
 impl Activity {
@@ -32,7 +33,7 @@ impl Activity {
     /// Whether Discord already shows this, ignoring the timeline jitter of polling the player.
     fn same(&self, other: &Self) -> bool {
         let close = |a: i64, b: i64| (a - b).abs() < 2000;
-        self.title == other.title && self.artist == other.artist && self.art_url == other.art_url && close(self.start_ms, other.start_ms)
+        self.title == other.title && self.artist == other.artist && self.art_urls == other.art_urls && close(self.start_ms, other.start_ms)
             && match (self.end_ms, other.end_ms) { (Some(a), Some(b)) => close(a, b), (a, b) => a == b }
     }
 }
@@ -57,11 +58,18 @@ fn presence(activity: Option<&Activity>, art: Option<&str>) -> Value {
     json!({"since": 0, "afk": false, "status": "online", "activities": activities})
 }
 
-/// Media proxy paths of album art Discord has already registered.
+/// Media proxy paths of album art Discord has already registered, and whether each image loads.
 #[derive(Default)]
-struct Art(HashMap<String, String>);
+struct Art(HashMap<String, String>, HashMap<String, bool>);
 
 impl Art {
+    /// Whether `url` loads. Discord shows a broken image for a missing one, such as a
+    /// YouTube video without a high-resolution thumbnail.
+    fn loads(&mut self, url: &str) -> bool {
+        *self.1.entry(url.to_owned()).or_insert_with(|| reqwest::blocking::Client::new().head(url).timeout(Duration::from_secs(10))
+            .send().is_ok_and(|response| response.status().is_success()))
+    }
+
     fn path(&mut self, token: &str, url: &str) -> Option<String> {
         if let Some(path) = self.0.get(url) { return Some(path.clone()); }
         let response = reqwest::blocking::Client::new()
@@ -77,7 +85,8 @@ impl Art {
     }
 
     fn presence(&mut self, token: &str, activity: Option<&Activity>) -> Value {
-        let art = activity.and_then(|activity| activity.art_url.as_deref()).and_then(|url| self.path(token, url));
+        let url = activity.and_then(|activity| activity.art_urls.iter().find(|url| self.loads(url)));
+        let art = url.and_then(|url| self.path(token, url));
         presence(activity, art.as_deref())
     }
 }
@@ -291,7 +300,7 @@ mod tests {
 
     #[test]
     fn presence_shows_the_song_not_the_player() {
-        let activity = Activity { title: "Hello, World".into(), artist: Some("Artist".into()), start_ms: 1000, end_ms: Some(181_000), art_url: None };
+        let activity = Activity { title: "Hello, World".into(), artist: Some("Artist".into()), start_ms: 1000, end_ms: Some(181_000), art_urls: vec![] };
         let value = presence(Some(&activity), Some("external/abc/https/example.com/cover.jpg"));
         let shown = &value["activities"][0];
         assert_eq!(shown["name"], "Artist", "the member list shows the artist");
@@ -302,7 +311,7 @@ mod tests {
         assert_eq!(shown["assets"]["large_image"], "mp:external/abc/https/example.com/cover.jpg");
         assert!(!value.to_string().to_lowercase().contains("oxidance"));
         assert_eq!(presence(None, None)["activities"], json!([]));
-        let long = Activity { title: "x".repeat(300), artist: None, start_ms: 0, end_ms: None, art_url: None };
+        let long = Activity { title: "x".repeat(300), artist: None, start_ms: 0, end_ms: None, art_urls: vec![] };
         let value = presence(Some(&long), None);
         assert_eq!(value["activities"][0]["name"].as_str().unwrap().len(), 128, "the title stands in for a missing artist");
         assert!(value["activities"][0].get("state").is_none() && value["activities"][0]["timestamps"].get("end").is_none());
@@ -311,10 +320,10 @@ mod tests {
 
     #[test]
     fn polling_jitter_is_not_resent() {
-        let activity = Activity { title: "Song".into(), artist: None, start_ms: 10_000, end_ms: Some(70_000), art_url: None };
+        let activity = Activity { title: "Song".into(), artist: None, start_ms: 10_000, end_ms: Some(70_000), art_urls: vec![] };
         assert!(activity.same(&Activity { start_ms: 10_400, end_ms: Some(70_400), ..activity.clone() }));
         assert!(!activity.same(&Activity { start_ms: 40_000, end_ms: Some(100_000), ..activity.clone() }), "a seek is resent");
         assert!(!activity.same(&Activity { title: "Other".into(), ..activity.clone() }));
-        assert!(!activity.same(&Activity { art_url: Some("https://example.com/cover.jpg".into()), ..activity.clone() }));
+        assert!(!activity.same(&Activity { art_urls: vec!["https://example.com/cover.jpg".into()], ..activity.clone() }));
     }
 }
