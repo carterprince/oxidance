@@ -588,7 +588,7 @@ impl Ui {
         let mut art_urls: Vec<String> = song.album_art_url.iter().filter(|url| url.starts_with("https://") || url.starts_with("http://"))
             .flat_map(|url| [oxidance::high_quality_art_url(url), url.clone()]).collect();
         art_urls.dedup();
-        Some(discord::Activity { title: song.title, artist: artist.filter(|artist| !artist.trim().is_empty()), start_ms, end_ms, art_urls })
+        Some(discord::Activity { title: song.title, artist: artist.filter(|artist| !artist.trim().is_empty()), start_ms, end_ms, art_urls, speed: rate })
     }
 
     fn update_sidebar_art(&self) {
